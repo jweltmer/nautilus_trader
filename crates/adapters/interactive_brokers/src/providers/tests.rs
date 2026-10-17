@@ -191,7 +191,14 @@ fn test_resolve_contract_for_spread_skips_bag_without_combo_legs() {
 
     let result = provider.resolve_contract_for_instrument(spread_id);
 
-    assert!(!result.is_ok_and(|contract| contract.contract_id == 9000));
+    // Never the cached BAG without combo legs, which IB could not fill
+    assert!(
+        result
+            .as_ref()
+            .map_or(true, |contract| contract.contract_id != 9000
+                && contract.security_type != SecurityType::Spread),
+        "resolved {result:?}"
+    );
 }
 
 #[rstest]
