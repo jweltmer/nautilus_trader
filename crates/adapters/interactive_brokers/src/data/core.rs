@@ -81,7 +81,10 @@ use super::{
 };
 use crate::{
     common::{
-        consts::IB_VENUE, contracts::parse_contract_from_json, shared_client::SharedClientHandle,
+        consts::IB_VENUE,
+        contracts::parse_contract_from_json,
+        shared_client::SharedClientHandle,
+        spreads::{is_spread_instrument_id, parse_spread_instrument_id_to_legs},
         symbology::is_crypto_contract,
     },
     config::{InteractiveBrokersDataClientConfig, MarketDataType},
@@ -205,6 +208,57 @@ fn params_to_string_filters(params: Option<&Params>) -> Option<HashMap<String, S
         .filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_string())))
         .collect();
     (!filters.is_empty()).then_some(filters)
+}
+
+/// Loads a requested instrument; a spread is built as a BAG from its legs, which symbology
+/// cannot resolve.
+async fn load_requested_instrument(
+    instrument_provider: &InteractiveBrokersInstrumentProvider,
+    client: &ibapi::Client,
+    instrument_id: InstrumentId,
+    force_update: bool,
+    filters: Option<HashMap<String, String>>,
+) -> anyhow::Result<()> {
+    if is_spread_instrument_id(&instrument_id) {
+        instrument_provider
+            .fetch_spread_instrument(client, instrument_id, force_update, filters)
+            .await
+            .map(|_| ())
+    } else {
+        instrument_provider
+            .fetch_contract_details(client, instrument_id, force_update, filters)
+            .await
+    }
+}
+
+/// Publishes a requested spread's legs, which leg fills need in the cache and the
+/// instrument response alone does not put there.
+fn publish_spread_legs(
+    instrument_provider: &InteractiveBrokersInstrumentProvider,
+    instrument_id: &InstrumentId,
+    data_sender: &EventSender<DataEvent>,
+) {
+    if !is_spread_instrument_id(instrument_id) {
+        return;
+    }
+    for leg in spread_leg_instruments(instrument_provider, instrument_id) {
+        if let Err(e) = data_sender.send(DataEvent::Instrument(leg)) {
+            tracing::error!("Failed to send spread leg instrument: {e}");
+        }
+    }
+}
+
+fn spread_leg_instruments(
+    instrument_provider: &InteractiveBrokersInstrumentProvider,
+    spread_instrument_id: &InstrumentId,
+) -> Vec<InstrumentAny> {
+    parse_spread_instrument_id_to_legs(spread_instrument_id)
+        .map(|legs| {
+            legs.iter()
+                .filter_map(|(leg_id, _)| instrument_provider.find(leg_id))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn datetime_to_unix_nanos(dt: jiff::Timestamp) -> UnixNanos {
@@ -1618,9 +1672,14 @@ impl DataClient for InteractiveBrokersDataClient {
                 self.spawn_command(async move {
                     let filters = params_to_string_filters(params.as_ref());
 
-                    if let Err(e) = instrument_provider
-                        .fetch_contract_details(&client_clone, instrument_id, force_update, filters)
-                        .await
+                    if let Err(e) = load_requested_instrument(
+                        &instrument_provider,
+                        &client_clone,
+                        instrument_id,
+                        force_update,
+                        filters,
+                    )
+                    .await
                     {
                         tracing::error!(
                             "Failed to fetch contract details for {}: {:?}",
@@ -1631,6 +1690,7 @@ impl DataClient for InteractiveBrokersDataClient {
                     }
 
                     if let Some(instrument) = instrument_provider.find(&instrument_id) {
+                        publish_spread_legs(&instrument_provider, &instrument_id, &data_sender);
                         let response = DataResponse::Instrument(Box::new(InstrumentResponse::new(
                             request_id,
                             client_id,
@@ -2470,6 +2530,27 @@ mod tests {
     #[case("0", false)]
     fn test_parse_bool_param_value(#[case] value: &str, #[case] expected: bool) {
         assert_eq!(parse_bool_param_value(value), expected);
+    }
+
+    #[rstest]
+    fn test_spread_leg_instruments_returns_legs_held_by_provider() {
+        let provider = InteractiveBrokersInstrumentProvider::new(Default::default());
+        let leg = nautilus_model::instruments::stubs::equity_aapl();
+        let leg_id = leg.id();
+        let missing_leg_id = InstrumentId::from(format!("MSFT.{}", leg_id.venue).as_str());
+        provider.insert_test_instrument(InstrumentAny::from(leg), 265598, 1);
+        let spread_id = crate::common::spreads::create_spread_instrument_id(&[
+            (leg_id, 1),
+            (missing_leg_id, -1),
+        ])
+        .unwrap();
+
+        let legs = spread_leg_instruments(&provider, &spread_id);
+
+        assert_eq!(
+            legs.iter().map(Instrument::id).collect::<Vec<_>>(),
+            vec![leg_id]
+        );
     }
 
     #[rstest]
