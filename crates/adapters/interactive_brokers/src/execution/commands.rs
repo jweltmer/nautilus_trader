@@ -15,6 +15,7 @@ use super::{
     core::*,
     transform::{convert_f64, convert_price},
 };
+use crate::common::spreads::is_spread_instrument_id;
 
 /// An order prepared for IB and tracked, with the submit lock held until it is sent.
 pub(super) struct PreparedOrder<'a> {
@@ -47,11 +48,17 @@ impl InteractiveBrokersExecutionClient {
         order_submit_lock: &Arc<tokio::sync::Mutex<()>>,
         request_timeout_secs: u64,
     ) -> anyhow::Result<()> {
-        let price_magnifier = instrument_provider.ensure_price_magnifier_async(
-            client,
-            cmd.instrument_id,
-            Duration::from_secs(request_timeout_secs),
-        );
+        let price_magnifier = async {
+            Self::load_missing_spread_instruments([cmd.instrument_id], client, instrument_provider)
+                .await?;
+            instrument_provider
+                .ensure_price_magnifier_async(
+                    client,
+                    cmd.instrument_id,
+                    Duration::from_secs(request_timeout_secs),
+                )
+                .await
+        };
         let Some(prepared) = Self::prepare_submit_order(
             cmd,
             price_magnifier,
@@ -525,6 +532,13 @@ impl InteractiveBrokersExecutionClient {
         instrument_ids.dedup();
 
         let price_magnifiers = async {
+            Self::load_missing_spread_instruments(
+                instrument_ids.iter().copied(),
+                client,
+                instrument_provider,
+            )
+            .await?;
+
             for instrument_id in instrument_ids {
                 instrument_provider
                     .ensure_price_magnifier_async(
@@ -929,6 +943,26 @@ impl InteractiveBrokersExecutionClient {
             Self::remove_order_tracking(ib_order_id, client_order_id, order_tracker)?;
         }
 
+        Ok(())
+    }
+
+    /// Builds any spread instrument the provider does not hold yet, so a spread first seen
+    /// after connect resolves to its BAG contract rather than a symbology fallback.
+    pub(super) async fn load_missing_spread_instruments(
+        instrument_ids: impl IntoIterator<Item = InstrumentId>,
+        client: &Client,
+        instrument_provider: &InteractiveBrokersInstrumentProvider,
+    ) -> anyhow::Result<()> {
+        for instrument_id in instrument_ids {
+            if is_spread_instrument_id(&instrument_id)
+                && instrument_provider.find(&instrument_id).is_none()
+            {
+                let loaded = instrument_provider
+                    .fetch_spread_instrument(client, instrument_id, false, None)
+                    .await?;
+                anyhow::ensure!(loaded, "Failed to load spread instrument {instrument_id}");
+            }
+        }
         Ok(())
     }
 

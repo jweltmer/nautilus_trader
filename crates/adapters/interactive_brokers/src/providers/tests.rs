@@ -181,6 +181,20 @@ fn test_resolve_instrument_id_for_bag_contract_uses_cached_combo_legs() {
 }
 
 #[rstest]
+fn test_resolve_contract_for_spread_skips_bag_without_combo_legs() {
+    let provider = create_test_provider();
+    let long_leg = InstrumentId::from("SPY C400.SMART");
+    let short_leg = InstrumentId::from("SPY C410.SMART");
+    let spread_id = create_spread_instrument_id(&[(long_leg, 1), (short_leg, -1)]).unwrap();
+    let spread = create_test_option_spread(spread_id);
+    provider.insert_test_instrument(InstrumentAny::from(spread), 9000, 1);
+
+    let result = provider.resolve_contract_for_instrument(spread_id);
+
+    assert!(!result.is_ok_and(|contract| contract.contract_id == 9000));
+}
+
+#[rstest]
 fn test_instrument_id_to_ib_contract_details() {
     let provider = create_test_provider();
     let instrument_id = InstrumentId::new(NautilusSymbol::from("AAPL"), Venue::from("NASDAQ"));

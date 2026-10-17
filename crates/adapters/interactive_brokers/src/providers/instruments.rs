@@ -1061,7 +1061,12 @@ impl InteractiveBrokersInstrumentProvider {
         &self,
         instrument_id: InstrumentId,
     ) -> anyhow::Result<Contract> {
-        let cached_contract = self.instrument_id_to_ib_contract(&instrument_id);
+        // A BAG contract without its combo legs cannot be submitted
+        let cached_contract =
+            self.instrument_id_to_ib_contract(&instrument_id)
+                .filter(|contract| {
+                    !is_spread_instrument_id(&instrument_id) || !contract.combo_legs.is_empty()
+                });
         if let Some(contract) = cached_contract.as_ref()
             && (contract.contract_id != 0 || is_spread_instrument_id(&instrument_id))
         {
@@ -1277,11 +1282,12 @@ impl InteractiveBrokersInstrumentProvider {
                 ratio
             );
 
-            // Load the individual leg instrument
+            // Load the individual leg instrument; a leg seeded from the cache has a contract
+            // but no contract details, so fetch it too
             self.fetch_contract_details(
                 client,
                 *leg_instrument_id,
-                force_instrument_update,
+                force_instrument_update || !self.contract_details.contains_key(leg_instrument_id),
                 filters.clone(),
             )
             .await
