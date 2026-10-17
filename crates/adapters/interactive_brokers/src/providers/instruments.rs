@@ -1466,7 +1466,24 @@ impl InteractiveBrokersInstrumentProvider {
         let mut details_vec = Vec::new();
         let mut last_error = None;
 
+        // A contract already held with its IB contract ID (seeded from the cache) is asked
+        // for by that ID: symbology cannot rebuild every listed contract from its instrument
+        // ID (an option on a MIC venue)
+        if let Some(contract) = self
+            .instrument_id_to_ib_contract(&instrument_id)
+            .filter(|contract| contract.contract_id != 0)
+        {
+            match client.contract_details(&contract).await {
+                Ok(result) if !result.is_empty() => details_vec = result,
+                Ok(_) => {}
+                Err(e) => last_error = Some((format!("contract ID {}", contract.contract_id), e)),
+            }
+        }
+
         for candidate_exchange in exchanges_to_try {
+            if !details_vec.is_empty() {
+                break;
+            }
             let contract = self
                 .symbology
                 .contract(instrument_id, Some(candidate_exchange.as_str()))
