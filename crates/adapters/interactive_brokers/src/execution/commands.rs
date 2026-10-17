@@ -954,11 +954,14 @@ impl InteractiveBrokersExecutionClient {
         instrument_provider: &InteractiveBrokersInstrumentProvider,
     ) -> anyhow::Result<()> {
         for instrument_id in instrument_ids {
-            if is_spread_instrument_id(&instrument_id)
-                && instrument_provider.find(&instrument_id).is_none()
-            {
+            // A spread held without a BAG carrying its combo legs (one seeded from the cache)
+            // cannot be submitted, so it is rebuilt too
+            let has_bag = instrument_provider
+                .instrument_id_to_ib_contract(&instrument_id)
+                .is_some_and(|contract| !contract.combo_legs.is_empty());
+            if is_spread_instrument_id(&instrument_id) && !has_bag {
                 let loaded = instrument_provider
-                    .fetch_spread_instrument(client, instrument_id, false, None)
+                    .fetch_spread_instrument(client, instrument_id, true, None)
                     .await?;
                 anyhow::ensure!(loaded, "Failed to load spread instrument {instrument_id}");
             }

@@ -1325,15 +1325,16 @@ impl InteractiveBrokersInstrumentProvider {
         )
         .context("Failed to parse spread instrument")?;
 
-        // Cache the spread instrument
-        self.instruments
-            .insert(spread_instrument_id, spread_instrument);
+        // Cache the spread instrument, its contract first so a concurrent submit that finds
+        // the instrument also finds its BAG
         self.contracts.insert(spread_instrument_id, bag_contract);
 
         if let Some((first_details, _)) = leg_contract_details.first() {
             self.price_magnifiers
                 .insert(spread_instrument_id, first_details.price_magnifier);
         }
+        self.instruments
+            .insert(spread_instrument_id, spread_instrument);
 
         tracing::debug!(
             "Successfully loaded spread instrument {}",
@@ -1572,15 +1573,18 @@ impl InteractiveBrokersInstrumentProvider {
 
         // A contract already held with its IB contract ID (seeded from the cache) is asked
         // for by that ID: symbology cannot rebuild every listed contract from its instrument
-        // ID (an option on a MIC venue)
-        if let Some(contract) = self
-            .instrument_id_to_ib_contract(&instrument_id)
-            .filter(|contract| contract.contract_id != 0)
+        // ID (an option on a MIC venue). An explicit exchange filter still goes by symbology.
+        if exchange.is_none()
+            && let Some(contract) = self
+                .instrument_id_to_ib_contract(&instrument_id)
+                .filter(|contract| contract.contract_id != 0)
         {
             match client.contract_details(&contract).await {
-                Ok(result) if !result.is_empty() => details_vec = result,
-                Ok(_) => {}
-                Err(e) => last_error = Some((format!("contract ID {}", contract.contract_id), e)),
+                Ok(result) => details_vec = result,
+                Err(e) => tracing::debug!(
+                    "Failed to fetch contract details for {instrument_id} by contract ID {}: {e}",
+                    contract.contract_id
+                ),
             }
         }
 
