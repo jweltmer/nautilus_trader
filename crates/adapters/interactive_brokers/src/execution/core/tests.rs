@@ -3509,7 +3509,7 @@ fn test_fill_report_collector_uses_provider_resolved_stock_venue() {
         create_test_commission_report("exec-aapl-001", 1.25),
     )));
 
-    let (evidence, combo_executions) = collector.finish().unwrap();
+    let (evidence, combo_executions) = collector.finish();
 
     assert_eq!(evidence.reports.len(), 1);
     assert!(evidence.combo_leg_reports.is_empty());
@@ -5730,7 +5730,7 @@ fn collect_mes_session(
         )));
     }
 
-    let (evidence, combo_executions) = collector.finish().unwrap();
+    let (evidence, combo_executions) = collector.finish();
     assert!(combo_executions.is_empty());
     evidence
 }
@@ -5902,7 +5902,7 @@ fn test_fill_report_collector_marks_all_missing_on_stream_error() {
     let mut collector = FillReportCollector::new(&context, &cmd, UnixNanos::default());
 
     collector.push(Err(ibapi::Error::ConnectionReset));
-    let (evidence, _) = collector.finish().unwrap();
+    let (evidence, _) = collector.finish();
 
     assert!(evidence.reports.is_empty());
     assert!(evidence.missing_all);
@@ -5919,7 +5919,7 @@ fn test_fill_report_collector_marks_all_missing_on_commission_without_execution(
     collector.push(Ok(Executions::CommissionReport(
         create_test_commission_report("exec-unseen-001", 0.61),
     )));
-    let (evidence, _) = collector.finish().unwrap();
+    let (evidence, _) = collector.finish();
 
     assert!(evidence.reports.is_empty());
     assert!(evidence.missing_all);
@@ -5939,7 +5939,7 @@ fn test_fill_report_collector_marks_instrument_missing_when_not_cached() {
     collector.push(Ok(Executions::CommissionReport(
         create_test_commission_report(MES_SESSION_EXECUTIONS[0].0, 0.61),
     )));
-    let (evidence, _) = collector.finish().unwrap();
+    let (evidence, _) = collector.finish();
 
     assert!(evidence.reports.is_empty());
     assert!(!evidence.missing_all);
@@ -5964,7 +5964,7 @@ fn test_fill_report_collector_marks_instrument_missing_on_execution_without_comm
     collector.push(Ok(Executions::ExecutionData(
         create_test_mes_execution_data(0),
     )));
-    let (evidence, _) = collector.finish().unwrap();
+    let (evidence, _) = collector.finish();
 
     assert!(evidence.reports.is_empty());
     assert!(!evidence.missing_all);
@@ -5995,7 +5995,7 @@ fn test_fill_report_collector_moves_combo_leg_fills_to_evidence() {
     collector.push(Ok(Executions::CommissionReport(
         create_test_commission_report("exec-leg-001", 0.65),
     )));
-    let (evidence, combo_executions) = collector.finish().unwrap();
+    let (evidence, combo_executions) = collector.finish();
 
     assert!(evidence.reports.is_empty());
     assert_eq!(evidence.combo_leg_reports.len(), 1);
