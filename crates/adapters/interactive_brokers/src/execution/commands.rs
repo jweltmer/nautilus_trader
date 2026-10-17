@@ -12,6 +12,7 @@
 use nautilus_common::live::sender::EventSender;
 
 use super::core::*;
+use crate::common::spreads::is_spread_instrument_id;
 
 impl InteractiveBrokersExecutionClient {
     #[allow(clippy::too_many_arguments)] // Command execution uses explicit client state.
@@ -78,6 +79,13 @@ impl InteractiveBrokersExecutionClient {
                 ts_event,
             )?;
             anyhow::bail!("{reason}");
+        }
+
+        if let Err(e) =
+            Self::load_missing_spread_instruments([cmd.instrument_id], client, instrument_provider)
+                .await
+        {
+            return Self::deny_unpreparable_order(cmd, &e, exec_sender, clock);
         }
 
         // An order that cannot be prepared for IB never leaves the client, so it is denied
@@ -459,6 +467,14 @@ impl InteractiveBrokersExecutionClient {
         let num_orders = orders.len();
         anyhow::ensure!(!orders.is_empty(), "Cannot submit an empty order list");
 
+        // Outside the submit lock, so the IB round trip does not hold up other submits
+        let spreads_loaded = Self::load_missing_spread_instruments(
+            orders.iter().map(OrderAny::instrument_id),
+            client,
+            instrument_provider,
+        )
+        .await;
+
         let _submit_guard = order_submit_lock.lock().await;
         let mut ib_order_ids = AHashMap::with_capacity(num_orders);
 
@@ -469,14 +485,16 @@ impl InteractiveBrokersExecutionClient {
 
         // Every order is prepared before the first reaches IB, so a list that cannot be
         // prepared leaves nothing parked at the venue and is denied as a whole
-        let prepared = match Self::prepare_order_list(
-            cmd,
-            orders,
-            &ib_order_ids,
-            order_tracker,
-            instrument_provider,
-            ib_account,
-        ) {
+        let prepared = match spreads_loaded.and_then(|()| {
+            Self::prepare_order_list(
+                cmd,
+                orders,
+                &ib_order_ids,
+                order_tracker,
+                instrument_provider,
+                ib_account,
+            )
+        }) {
             Ok(prepared) => prepared,
             Err(e) => {
                 let reason = coded_denial_reason(DENIAL_ORDER_LIST_INVALID, &format!("{e:#}"));
@@ -737,6 +755,26 @@ impl InteractiveBrokersExecutionClient {
             Self::remove_order_tracking(ib_order_id, client_order_id, order_tracker)?;
         }
 
+        Ok(())
+    }
+
+    /// Builds any spread instrument the provider does not hold yet, so a spread first seen
+    /// after connect resolves to its BAG contract rather than a symbology fallback.
+    pub(super) async fn load_missing_spread_instruments(
+        instrument_ids: impl IntoIterator<Item = InstrumentId>,
+        client: &Client,
+        instrument_provider: &InteractiveBrokersInstrumentProvider,
+    ) -> anyhow::Result<()> {
+        for instrument_id in instrument_ids {
+            if is_spread_instrument_id(&instrument_id)
+                && instrument_provider.find(&instrument_id).is_none()
+            {
+                let loaded = instrument_provider
+                    .fetch_spread_instrument(client, instrument_id, false, None)
+                    .await?;
+                anyhow::ensure!(loaded, "Failed to load spread instrument {instrument_id}");
+            }
+        }
         Ok(())
     }
 
