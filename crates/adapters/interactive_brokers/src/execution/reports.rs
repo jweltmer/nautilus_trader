@@ -665,17 +665,22 @@ impl<'a> FillReportCollector<'a> {
     ///
     /// # Errors
     ///
-    /// Returns an error if an execution has no commission report.
+    /// Returns an error if a combo fill report cannot be built.
     pub(super) fn finish(mut self) -> anyhow::Result<(FillEvidence, Vec<ExecutionData>)> {
-        anyhow::ensure!(
-            self.pending_exec_data.is_empty(),
-            "IB did not provide commission reports for execution IDs: {}",
-            self.pending_exec_data
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        // An execution without its commission report leaves its instrument's fills incomplete
+        // rather than failing reconciliation, like an execution that cannot be parsed
+        for (execution_id, exec_data) in std::mem::take(&mut self.pending_exec_data) {
+            tracing::warn!("IB did not provide a commission report for execution {execution_id}");
+            match self
+                .context
+                .resolve_historical_execution_instrument_id(&exec_data)
+            {
+                Ok(instrument_id) => {
+                    self.evidence.missing_instruments.insert(instrument_id);
+                }
+                Err(_) => self.evidence.missing_all = true,
+            }
+        }
 
         // A commission report without its execution means an execution never arrived
         if !self.pending_commissions.is_empty() {
