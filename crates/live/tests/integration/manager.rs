@@ -67,9 +67,10 @@ use nautilus_live::{
 };
 use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
+    data::InstrumentClose,
     enums::{
-        AccountType, AvgPxReconciliation, ContingencyType, LiquiditySide, OmsType, OrderSide,
-        OrderStatus, OrderType, PositionSide, TimeInForce, TriggerType,
+        AccountType, AvgPxReconciliation, ContingencyType, InstrumentCloseType, LiquiditySide,
+        OmsType, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce, TriggerType,
     },
     events::{
         OrderEventAny, OrderFilled,
@@ -86,7 +87,10 @@ use nautilus_model::{
     },
     instruments::{
         Instrument, InstrumentAny,
-        stubs::{binary_option, btcusd_bybit, crypto_perpetual_ethusdt, currency_pair_btcusdt},
+        stubs::{
+            binary_option, btcusd_bybit, crypto_perpetual_ethusdt, currency_pair_btcusdt,
+            option_contract_appl,
+        },
     },
     orders::{
         Order, OrderAny, OrderTestBuilder,
@@ -12837,6 +12841,137 @@ async fn test_netting_position_flat_report_closes_cached_position() {
     // Fill should be SELL 5.0 (close long position)
     assert_eq!(fill_events[0].order_side, OrderSide::Sell);
     assert_eq!(fill_events[0].last_qty, Quantity::from("5.0"));
+}
+
+fn expired_option_with_short_position(
+    ctx: &TestContext,
+    close: Option<(&str, InstrumentCloseType)>,
+) {
+    let instrument = InstrumentAny::OptionContract(option_contract_appl());
+    ctx.add_instrument(instrument.clone());
+    ctx.add_position(&create_test_position(
+        &instrument,
+        PositionId::from("P-EXPIRY"),
+        OrderSide::Sell,
+        "10",
+        "2.50",
+    ));
+
+    if let Some((price, close_type)) = close {
+        ctx.cache
+            .borrow_mut()
+            .add_instrument_close(InstrumentClose::new(
+                instrument.id(),
+                Price::from(price),
+                close_type,
+                UnixNanos::from(1_000_000),
+                UnixNanos::from(1_000_000),
+            ))
+            .unwrap();
+    }
+}
+
+#[rstest]
+#[case::settles_in_the_money(Some(("0.75", InstrumentCloseType::ContractExpired)), "0.75")]
+#[case::settles_worthless(Some(("0.00", InstrumentCloseType::ContractExpired)), "0.00")]
+#[case::session_close_is_not_a_settlement(Some(("0.75", InstrumentCloseType::EndOfSession)), "2.50")]
+#[case::no_close_keeps_average_open(None, "2.50")]
+#[tokio::test]
+async fn test_position_check_closes_expired_contract_at_its_settlement_price(
+    #[case] close: Option<(&str, InstrumentCloseType)>,
+    #[case] expected_px: &str,
+) {
+    let config = ExecutionManagerConfig {
+        position_check_threshold_ns: DurationNanos::ZERO,
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    expired_option_with_short_position(&ctx, close);
+
+    // The venue no longer reports the contract
+    let mock_client = MockExecutionClient::new(vec![]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
+
+    let events = ctx.manager.check_positions_consistency(&clients).await;
+
+    assert_eq!(
+        filled_events(&events),
+        vec![(
+            OrderSide::Buy,
+            Quantity::from("10"),
+            Price::from(expected_px)
+        )],
+    );
+}
+
+#[tokio::test]
+async fn test_position_check_leaves_expired_contract_open_while_venue_holds_it() {
+    let config = ExecutionManagerConfig {
+        position_check_threshold_ns: DurationNanos::ZERO,
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    expired_option_with_short_position(&ctx, Some(("0.75", InstrumentCloseType::ContractExpired)));
+    let instrument_id = option_contract_appl().id();
+
+    let venue_report = PositionStatusReport::new(
+        test_account_id(),
+        instrument_id,
+        PositionSide::Short,
+        Quantity::from("10"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+        None,
+        Some(dec!(2.50)),
+    );
+    let mock_client = MockPositionExecutionClient::new(vec![], vec![venue_report]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
+
+    let events = ctx.manager.check_positions_consistency(&clients).await;
+
+    assert!(events.is_empty());
+    assert_eq!(
+        ctx.cache
+            .borrow()
+            .positions_open(None, Some(&instrument_id), None, None, None)
+            .len(),
+        1,
+    );
+}
+
+#[tokio::test]
+async fn test_flat_report_closes_expired_contract_at_its_settlement_price() {
+    let mut ctx = TestContext::new();
+    expired_option_with_short_position(&ctx, Some(("0.75", InstrumentCloseType::ContractExpired)));
+
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+    mass_status.add_position_reports(vec![PositionStatusReport::new(
+        test_account_id(),
+        option_contract_appl().id(),
+        PositionSide::Flat,
+        Quantity::from("0"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+        None,
+        None,
+    )]);
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+
+    assert_eq!(
+        filled_events(&result.events),
+        vec![(OrderSide::Buy, Quantity::from("10"), Price::from("0.75"))],
+    );
 }
 
 #[tokio::test]
