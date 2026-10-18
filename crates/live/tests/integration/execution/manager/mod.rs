@@ -70,9 +70,10 @@ use nautilus_live::{
 };
 use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
+    data::InstrumentClose,
     enums::{
-        AccountType, AvgPxReconciliation, ContingencyType, LiquiditySide, OmsType, OrderSide,
-        OrderStatus, OrderType, PositionSide, TimeInForce, TriggerType,
+        AccountType, AvgPxReconciliation, ContingencyType, InstrumentCloseType, LiquiditySide,
+        OmsType, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce, TriggerType,
     },
     events::{
         OrderEventAny, OrderFilled, PositionEvent,
@@ -91,7 +92,7 @@ use nautilus_model::{
         Instrument, InstrumentAny,
         stubs::{
             binary_option, btcusd_bybit, crypto_perpetual_ethusdt, currency_pair_btcusdt,
-            equity_aapl,
+            equity_aapl, option_contract_appl,
         },
     },
     orders::{

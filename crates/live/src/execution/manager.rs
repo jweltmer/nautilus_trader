@@ -77,7 +77,7 @@ use nautilus_execution::{
     },
 };
 use nautilus_model::{
-    enums::{AvgPxReconciliation, OmsType, OrderSide, OrderStatus},
+    enums::{AvgPxReconciliation, InstrumentCloseType, OmsType, OrderSide, OrderStatus},
     events::{OrderEventAny, OrderFilled, OrderInitialized, OrderUpdated},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId,
@@ -3684,6 +3684,27 @@ impl ExecutionManager {
         self.cache().instrument(instrument_id).cloned()
     }
 
+    /// Returns the cached contract-expiration close price when the venue reports `instrument_id`
+    /// flat.
+    ///
+    /// A venue stops reporting a contract once it has settled it at expiration. Closing the cached
+    /// position at its own average open price would realize no profit or loss on the settlement,
+    /// so the synthetic close takes the settlement price instead.
+    fn expiration_close_px(
+        &self,
+        instrument_id: &InstrumentId,
+        venue_signed_qty: Decimal,
+    ) -> Option<Decimal> {
+        if venue_signed_qty != Decimal::ZERO {
+            return None;
+        }
+
+        self.cache()
+            .instrument_close(instrument_id)
+            .filter(|close| close.close_type == InstrumentCloseType::ContractExpired)
+            .map(|close| close.close_price.as_decimal())
+    }
+
     fn should_skip_order_report(&self, report: &OrderStatusReport) -> bool {
         let client_order_id = report.client_order_id.or_else(|| {
             self.cache
@@ -4105,15 +4126,19 @@ impl ExecutionManager {
                 OrderSide::Sell
             };
 
-            let fill_px = reconciliation_fill_px(
-                instrument,
-                cached_signed_qty,
-                cached_avg_px,
-                venue_signed_qty,
-                venue_avg_px,
-                venue_report.map_or_default(|report| report.avg_px_open_reconciliation),
-                venue_report.and_then(|report| report.avg_px_open_precision),
-            )?;
+            let fill_px = self
+                .expiration_close_px(&instrument_id, venue_signed_qty)
+                .or_else(|| {
+                    reconciliation_fill_px(
+                        instrument,
+                        cached_signed_qty,
+                        cached_avg_px,
+                        venue_signed_qty,
+                        venue_avg_px,
+                        venue_report.map_or_default(|report| report.avg_px_open_reconciliation),
+                        venue_report.and_then(|report| report.avg_px_open_precision),
+                    )
+                })?;
             let quantity =
                 Quantity::from_decimal_dp(qty_diff.abs(), instrument.size_precision()).ok()?;
             let order_report = create_position_reconciliation_report(
@@ -4567,15 +4592,19 @@ impl ExecutionManager {
             OrderSide::Sell
         };
 
-        let fill_px = reconciliation_fill_px(
-            instrument,
-            cached_signed_qty,
-            current_avg_px,
-            venue_signed_qty,
-            report.avg_px_open,
-            report.avg_px_open_reconciliation,
-            report.avg_px_open_precision,
-        )?;
+        let fill_px = self
+            .expiration_close_px(&instrument_id, venue_signed_qty)
+            .or_else(|| {
+                reconciliation_fill_px(
+                    instrument,
+                    cached_signed_qty,
+                    current_avg_px,
+                    venue_signed_qty,
+                    report.avg_px_open,
+                    report.avg_px_open_reconciliation,
+                    report.avg_px_open_precision,
+                )
+            })?;
 
         let ts_now = self.clock.borrow().timestamp_ns();
         let order_report = create_position_reconciliation_report(
