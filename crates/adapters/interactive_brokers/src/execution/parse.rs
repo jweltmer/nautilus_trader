@@ -28,8 +28,8 @@ use jiff::{
 use nautilus_core::{UnixNanos, datetime::get_timezone};
 use nautilus_model::{
     enums::{
-        ContingencyType, LiquiditySide, OrderSide, OrderStatus as NautilusOrderStatus, OrderType,
-        TimeInForce, TrailingOffsetType,
+        AvgPxReconciliation, ContingencyType, LiquiditySide, OrderSide,
+        OrderStatus as NautilusOrderStatus, OrderType, TimeInForce, TrailingOffsetType,
     },
     identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId},
     instruments::Instrument,
@@ -169,7 +169,9 @@ impl FillEvidence {
 /// it. The entry price therefore replaces IB's average cost only when every execution of the
 /// instrument was parsed and the entry price plus the opening commissions per unit reproduces
 /// IB's average cost, within the rounding of the average cost and of each commission. Otherwise
-/// the position keeps IB's average cost, which position recovery prices from.
+/// the position keeps IB's average cost, which position recovery prices from. Its commissions
+/// make it incomparable with the average fill price of a cached position, so a kept average cost
+/// is marked [`AvgPxReconciliation::OpeningOnly`].
 pub(crate) fn fill_position_avg_px_from_fills(
     position_reports: &mut [PositionStatusReport],
     evidence: &FillEvidence,
@@ -183,6 +185,8 @@ pub(crate) fn fill_position_avg_px_from_fills(
         let Some(venue_avg_px) = report.avg_px_open else {
             continue;
         };
+        report.avg_px_open_reconciliation = AvgPxReconciliation::OpeningOnly;
+
         let Some(instrument) = instrument_provider.find(&instrument_id) else {
             continue;
         };
@@ -234,6 +238,7 @@ pub(crate) fn fill_position_avg_px_from_fills(
 
         if (venue_avg_px - venue_avg_px_expected).abs() <= tolerance {
             report.avg_px_open = Some(lot.avg_px);
+            report.avg_px_open_reconciliation = AvgPxReconciliation::Match;
         } else {
             tracing::debug!(
                 "Keeping IB average cost {venue_avg_px} for {instrument_id}: fills give entry \
@@ -1132,6 +1137,58 @@ mod tests {
         );
 
         assert_eq!(avg_px_open, Some(Decimal::from_str(expected).unwrap()));
+    }
+
+    #[rstest]
+    // A short opened before the window keeps IB's average cost, which nets the opening
+    // commissions in and so never matches the cached average, while the entry price of a short
+    // opened in the window is compared
+    #[case::opened_before_window(vec![], "229.53", AvgPxReconciliation::OpeningOnly)]
+    #[case::reduced_in_window(
+        vec![(OrderSide::Buy, "2", "228.00")],
+        "229.53",
+        AvgPxReconciliation::OpeningOnly
+    )]
+    #[case::opened_in_window(
+        vec![(OrderSide::Sell, "7", "229.67")],
+        "229.67",
+        AvgPxReconciliation::Match
+    )]
+    fn test_fill_position_avg_px_from_fills_sets_avg_px_reconciliation(
+        #[case] fills: Vec<(OrderSide, &str, &str)>,
+        #[case] expected: &str,
+        #[case] expected_reconciliation: AvgPxReconciliation,
+    ) {
+        let evidence = FillEvidence {
+            reports: fills
+                .into_iter()
+                .enumerate()
+                .map(|(index, (side, qty, px))| {
+                    create_test_entry_fill(side, qty, px, &format!("T-{index}"), index as u64 + 10)
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut position_reports = vec![create_test_entry_position_report(
+            PositionSide::Short,
+            "7",
+            "229.53",
+        )];
+
+        fill_position_avg_px_from_fills(
+            &mut position_reports,
+            &evidence,
+            &create_test_avg_px_provider(),
+        );
+
+        assert_eq!(
+            position_reports[0].avg_px_open,
+            Some(Decimal::from_str(expected).unwrap())
+        );
+        assert_eq!(
+            position_reports[0].avg_px_open_reconciliation,
+            expected_reconciliation
+        );
     }
 
     // A ZC-like contract: IB prices it in cents (magnifier 100) and its multiplier is 5000
