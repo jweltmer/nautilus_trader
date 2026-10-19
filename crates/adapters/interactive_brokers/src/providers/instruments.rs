@@ -1653,7 +1653,11 @@ impl InteractiveBrokersInstrumentProvider {
     ) -> Vec<InstrumentId> {
         let mut processed_ids = Vec::new();
 
-        for details in details_vec {
+        for mut details in details_vec {
+            // Held contracts are sent back to IB, so each is stored with its expiry's time
+            // split from its date whichever request fetched it (see `split_last_trade_date`)
+            split_last_trade_date(&mut details);
+
             match self.process_contract_detail(&details, venue, force_instrument_update) {
                 Ok(Some(instrument_id)) => processed_ids.push(instrument_id),
                 Ok(None) => {}
@@ -3340,6 +3344,35 @@ mod tests {
             );
             assert_eq!(details.last_trade_time, "08:30:00 US/Central");
         }
+    }
+
+    #[rstest]
+    fn test_process_contract_details_cuts_expiry_to_date() {
+        let provider = InteractiveBrokersInstrumentProvider::new(Default::default());
+        let instrument_id = InstrumentId::from("AAPL  270115P00155000.OPRA");
+        let mut details = opra_option_contract_details(Contract::default());
+        details.contract.last_trade_date_or_contract_month =
+            String::from("20270115 15:00:00 US/Central");
+
+        let loaded_ids =
+            provider.process_contract_details(vec![details], Some(instrument_id.venue), false);
+
+        assert_eq!(loaded_ids, vec![instrument_id]);
+        assert_eq!(
+            provider
+                .resolve_contract_for_instrument(instrument_id)
+                .unwrap()
+                .last_trade_date_or_contract_month,
+            "20270115"
+        );
+        let details = provider
+            .instrument_id_to_ib_contract_details(&instrument_id)
+            .unwrap();
+        assert_eq!(
+            details.contract.last_trade_date_or_contract_month,
+            "20270115"
+        );
+        assert_eq!(details.last_trade_time, "15:00:00 US/Central");
     }
 
     #[tokio::test]
