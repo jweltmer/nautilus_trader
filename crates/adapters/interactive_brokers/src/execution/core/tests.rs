@@ -4103,6 +4103,59 @@ async fn test_handle_spread_execution_emits_only_leg_fill_event() {
     assert_eq!(order.spread_fill_ids.len(), 1);
 }
 
+// Seeding another spread under a venue alias remaps the leg's contract ID; the working spread
+// still resolves its leg execution to its own leg
+#[tokio::test]
+async fn test_handle_spread_execution_resolves_tracked_leg_after_alias_remap() {
+    let instrument_provider = create_test_instrument_provider();
+    let mut leg = equity_aapl();
+    leg.id = create_test_leg_instrument();
+    let leg_id = leg.id;
+    let spread = create_test_option_spread();
+    let spread_instrument_id = spread.id;
+    instrument_provider.insert_test_instrument(InstrumentAny::from(leg), 12345, 1);
+    instrument_provider.insert_test_instrument(InstrumentAny::from(spread), 54321, 1);
+    instrument_provider.insert_test_contract_id_mapping(
+        12345,
+        InstrumentId::new(leg_id.symbol, Venue::from("CBOE")),
+    );
+    let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let orders = OrderTracker::new(NATIVE_CLIENT_ID);
+    let exec_data = create_test_execution_data(213, "exec-001", 3.0, 5.25, "BOT");
+    let client_order_id = ClientOrderId::from("O-001");
+    let context = create_tracked_order_context(client_order_id, spread_instrument_id);
+    insert_tracked_order(&orders, exec_data.execution.order_id, context.clone());
+    let fill = SpreadFillContext {
+        client_order_id,
+        spread_instrument_id,
+        commission: 1.0,
+        commission_currency: "USD",
+        ts_init: UnixNanos::new(0),
+        account_id: AccountId::from("IB-001"),
+    };
+
+    let resolved = InteractiveBrokersExecutionClient::handle_spread_execution(
+        &exec_data,
+        &fill,
+        &instrument_provider,
+        &exec_sender.clone().into(),
+        &orders,
+        &context,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resolved, Some(leg_id));
+
+    match exec_receiver.try_recv().unwrap() {
+        ExecutionEvent::Order(OrderEventAny::Filled(fill)) => {
+            assert_eq!(fill.instrument_id, leg_id);
+        }
+        other => panic!("unexpected leg event: {other:?}"),
+    }
+    assert!(exec_receiver.try_recv().is_err());
+}
+
 #[tokio::test]
 async fn test_handle_spread_execution_rejects_non_leg_execution() {
     let instrument_provider = create_test_instrument_provider();
@@ -7311,4 +7364,66 @@ async fn test_run_order_update_stream_stops_when_bind_fails_with_shutdown() {
         1,
         "no retry after a bind failed with a shutdown"
     );
+}
+
+#[rstest]
+fn seed_instruments_from_cache_adds_a_spreads_legs() {
+    let (client, _rx, cache) = create_test_execution_client();
+    let legs = [
+        (InstrumentId::from("AAPL.NASDAQ"), 265_598),
+        (InstrumentId::from("MSFT.NASDAQ"), 272_093),
+    ];
+
+    for (leg_id, contract_id) in legs {
+        let contract = Contract {
+            contract_id,
+            symbol: IBSymbol::from(leg_id.symbol.as_str()),
+            security_type: SecurityType::Stock,
+            exchange: Exchange::from("SMART"),
+            currency: IBCurrency::from("USD"),
+            ..Default::default()
+        };
+        let info = Params::new(
+            [
+                (
+                    String::from("contract"),
+                    crate::common::contracts::contract_to_json_value(&contract),
+                ),
+                (String::from("priceMagnifier"), serde_json::Value::from(1)),
+            ]
+            .into(),
+        );
+        let instrument: InstrumentAny = CurrencyPair::builder()
+            .instrument_id(leg_id)
+            .raw_symbol(Symbol::from(leg_id.symbol.as_str()))
+            .base_currency(Currency::from("EUR"))
+            .quote_currency(Currency::from("USD"))
+            .price_precision(2)
+            .size_precision(0)
+            .price_increment(Price::from("0.01"))
+            .size_increment(Quantity::from(1))
+            .maybe_info(Some(info))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap()
+            .into();
+        cache.borrow_mut().add_instrument(instrument).unwrap();
+    }
+    let spread_id =
+        crate::common::spreads::create_spread_instrument_id(&[(legs[0].0, 1), (legs[1].0, -1)])
+            .unwrap();
+
+    client.seed_instruments_from_cache([spread_id]);
+
+    for (leg_id, contract_id) in legs {
+        assert_eq!(
+            client
+                .instrument_provider
+                .resolve_contract_for_instrument(leg_id)
+                .unwrap()
+                .contract_id,
+            contract_id
+        );
+    }
 }

@@ -235,13 +235,8 @@ impl InteractiveBrokersExecutionClient {
         &self,
         instrument_ids: impl IntoIterator<Item = InstrumentId>,
     ) {
-        let cache = self.core.cache();
-        let instruments: Vec<_> = instrument_ids
-            .into_iter()
-            .filter(|instrument_id| self.instrument_provider.find(instrument_id).is_none())
-            .filter_map(|instrument_id| cache.instrument(&instrument_id).cloned())
-            .collect();
-        self.instrument_provider.add_cached_instruments(instruments);
+        self.instrument_provider
+            .seed_from_cache_for(&self.core.cache(), instrument_ids);
     }
 
     pub(super) async fn preload_cached_instruments(&self, client: &Client) {

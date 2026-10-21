@@ -305,6 +305,27 @@ impl InteractiveBrokersInstrumentProvider {
         count
     }
 
+    /// Adds the cached instruments for `instrument_ids` that the provider does not hold, with a
+    /// spread's legs, so the spread's BAG requests each leg by its IB contract ID and its leg
+    /// executions resolve to its own legs.
+    pub(crate) fn seed_from_cache_for(
+        &self,
+        cache: &Cache,
+        instrument_ids: impl IntoIterator<Item = InstrumentId>,
+    ) -> usize {
+        let instruments: Vec<_> = instrument_ids
+            .into_iter()
+            .flat_map(|instrument_id| {
+                let legs: Vec<_> = parse_spread_instrument_id_to_legs(&instrument_id)
+                    .map_or_default(|legs| legs.into_iter().map(|(leg, _)| leg).collect());
+                std::iter::once(instrument_id).chain(legs)
+            })
+            .filter(|instrument_id| self.find(instrument_id).is_none())
+            .filter_map(|instrument_id| cache.instrument(&instrument_id).cloned())
+            .collect();
+        self.add_cached_instruments(instruments)
+    }
+
     /// Adds instruments already held by the Nautilus cache into the provider cache.
     ///
     /// This mirrors the Python provider's use of `client._cache` for venue resolution and for
@@ -1526,6 +1547,32 @@ fn expiry_bound_from_days(days: Option<u32>) -> Option<String> {
 }
 
 impl InteractiveBrokersInstrumentProvider {
+    // A contract held with its IB contract ID (seeded from the cache) is requested by that ID:
+    // symbology cannot rebuild every listed contract from its instrument ID (an option on a MIC
+    // venue). A contract held under another ID goes by symbology, as does a continuous future,
+    // which shares its instrument ID with the dated future, and a contract held on an exchange
+    // symbology would not request (loaded under an exchange filter), so the default listing
+    // applies once the filter is removed.
+    fn held_contract_request(
+        &self,
+        instrument_id: &InstrumentId,
+        default_exchanges: &[String],
+    ) -> Option<Contract> {
+        self.instrument_id_to_ib_contract(instrument_id)
+            .filter(|contract| {
+                contract.contract_id != 0
+                    && contract.security_type != SecurityType::ContinuousFuture
+                    && self
+                        .instrument_id_from_contract(contract, instrument_id.venue)
+                        .is_ok_and(|held_id| held_id == *instrument_id)
+                    && default_exchanges.iter().any(|exchange| {
+                        self.symbology
+                            .contract(*instrument_id, Some(exchange.as_str()))
+                            .is_ok_and(|request| request.exchange == contract.exchange)
+                    })
+            })
+    }
+
     /// Fetch and cache contract details for an instrument ID using the provided IB client.
     ///
     /// # Errors
@@ -1562,10 +1609,29 @@ impl InteractiveBrokersInstrumentProvider {
             possible_exchanges_for_venue(instrument_id.venue.as_str())
         };
 
-        let mut details_vec = Vec::new();
+        let held_contract = if exchange.is_none() {
+            self.held_contract_request(&instrument_id, &exchanges_to_try)
+        } else {
+            None
+        };
+        let mut details_vec = match held_contract {
+            Some(contract) => request_contract_details(client, &contract)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::debug!(
+                        "Failed to fetch contract details for {instrument_id} by contract ID {}: {e}",
+                        contract.contract_id
+                    );
+                    Vec::new()
+                }),
+            None => Vec::new(),
+        };
         let mut last_error = None;
 
         for candidate_exchange in exchanges_to_try {
+            if !details_vec.is_empty() {
+                break;
+            }
             let contract = self
                 .symbology
                 .contract(instrument_id, Some(candidate_exchange.as_str()))
@@ -2695,7 +2761,7 @@ mod tests {
     use nautilus_common::config::ConfigError;
     use nautilus_core::{Params, UnixNanos};
     use nautilus_model::{
-        identifiers::{Symbol, Venue},
+        identifiers::{Symbol, Venue, futures::FuturesYearDigits},
         instruments::CurrencyPair,
         types::{Price, Quantity, currency::Currency},
     };
@@ -2962,6 +3028,99 @@ mod tests {
             cached_details.valid_exchanges,
             vec!["SMART".to_string(), "CBOE".to_string()]
         );
+    }
+
+    // A forced refresh requests a held contract by its contract ID only on the listing symbology
+    // would request, so a contract loaded under an exchange filter goes by symbology on the
+    // default listing once the filter is removed
+    #[rstest]
+    #[case::default_listing("SMART", true)]
+    #[case::filtered_listing("CBOE", false)]
+    fn test_held_option_requested_by_contract_id_on_default_listing(
+        #[case] held_exchange: &str,
+        #[case] requested_by_contract_id: bool,
+    ) {
+        let provider = InteractiveBrokersInstrumentProvider::new(Default::default()).unwrap();
+        let mut details = opra_option_contract_details(Contract::default());
+        details.contract.exchange = Exchange::from(held_exchange);
+        let instrument_id = provider
+            .process_contract_detail(&details, Some(Venue::from("OPRA")), false)
+            .unwrap()
+            .unwrap();
+
+        let request =
+            provider.held_contract_request(&instrument_id, &possible_exchanges_for_venue("OPRA"));
+
+        assert_eq!(
+            request.map(|contract| (contract.contract_id, contract.exchange)),
+            requested_by_contract_id.then(|| (12_345, Exchange::from(held_exchange)))
+        );
+    }
+
+    // A stock is held on SMART, which symbology requests for its venue, so a restored leg keeps
+    // SMART routing rather than its primary exchange
+    #[rstest]
+    fn test_held_stock_requested_by_contract_id_on_smart() {
+        let provider = InteractiveBrokersInstrumentProvider::new(Default::default()).unwrap();
+        let instrument_id = InstrumentId::new(Symbol::from("XOM"), Venue::from("NYSE"));
+        let contract = Contract {
+            contract_id: 13_977,
+            symbol: ibapi::contracts::Symbol::from("XOM"),
+            security_type: SecurityType::Stock,
+            exchange: Exchange::from("SMART"),
+            primary_exchange: Exchange::from("NYSE"),
+            currency: ibapi::contracts::Currency::from("USD"),
+            ..Default::default()
+        };
+        provider.add_cached_instruments([create_test_instrument_with_info(
+            instrument_id,
+            Some(create_contract_info(&contract, Some(1))),
+        )]);
+
+        let request = provider
+            .held_contract_request(&instrument_id, &possible_exchanges_for_venue("NYSE"))
+            .unwrap();
+
+        assert_eq!(request.contract_id, 13_977);
+        assert_eq!(request.exchange.as_str(), "SMART");
+    }
+
+    // A cached continuous future shares its instrument ID with the dated future, so a forced
+    // refresh of that ID looks up the dated future rather than the continuous contract
+    #[rstest]
+    #[case::dated(SecurityType::Future, true)]
+    #[case::continuous(SecurityType::ContinuousFuture, false)]
+    fn test_held_contract_request_skips_continuous_future(
+        #[case] security_type: SecurityType,
+        #[case] requested_by_contract_id: bool,
+    ) {
+        // One-digit years give the dated future and the continuous contract one instrument ID
+        let provider =
+            InteractiveBrokersInstrumentProvider::new(InteractiveBrokersInstrumentProviderConfig {
+                futures_year_digits: FuturesYearDigits::One,
+                ..Default::default()
+            })
+            .unwrap();
+        let dated_id = InstrumentId::new(Symbol::from("ESZ6"), Venue::from("CME"));
+        let contract = Contract {
+            security_type,
+            ..create_future_contract_with_expiry_time()
+        };
+        assert_eq!(
+            provider
+                .instrument_id_from_contract(&contract, dated_id.venue)
+                .unwrap(),
+            dated_id
+        );
+        provider.add_cached_instruments([create_test_instrument_with_info(
+            dated_id,
+            Some(create_contract_info(&contract, Some(1))),
+        )]);
+
+        let request =
+            provider.held_contract_request(&dated_id, &possible_exchanges_for_venue("CME"));
+
+        assert_eq!(request.is_some(), requested_by_contract_id);
     }
 
     fn create_test_instrument_with_info(
