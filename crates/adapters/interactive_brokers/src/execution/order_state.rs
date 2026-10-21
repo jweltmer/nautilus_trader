@@ -238,6 +238,12 @@ impl InteractiveBrokersExecutionClient {
         let cache = self.core.cache();
         let instruments: Vec<_> = instrument_ids
             .into_iter()
+            // A spread's legs come too: building its BAG requests each leg by its contract ID
+            .flat_map(|instrument_id| {
+                let legs: Vec<_> = parse_spread_instrument_id_to_legs(&instrument_id)
+                    .map_or_default(|legs| legs.into_iter().map(|(leg, _)| leg).collect());
+                std::iter::once(instrument_id).chain(legs)
+            })
             .filter(|instrument_id| self.instrument_provider.find(instrument_id).is_none())
             .filter_map(|instrument_id| cache.instrument(&instrument_id).cloned())
             .collect();
