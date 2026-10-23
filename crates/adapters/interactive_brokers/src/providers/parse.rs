@@ -254,6 +254,10 @@ fn ib_contract_info(details: &ibapi::contracts::ContractDetails) -> nautilus_cor
         "priceMagnifier".to_string(),
         serde_json::Value::from(details.price_magnifier),
     );
+    info.insert(
+        "orderTypes".to_string(),
+        serde_json::Value::from(details.order_types.join(",")),
+    );
     nautilus_core::Params::new(info)
 }
 
@@ -866,6 +870,45 @@ mod tests {
         assert_eq!(
             equity.info.unwrap().get("priceMagnifier"),
             Some(&serde_json::Value::from(100))
+        );
+    }
+
+    #[rstest]
+    fn test_parse_contract_preserves_order_types_in_info() {
+        let details = ContractDetails {
+            contract: Contract {
+                symbol: Symbol::from("SPXW"),
+                security_type: SecurityType::Option,
+                exchange: Exchange::from("SMART"),
+                currency: Currency::from("USD"),
+                local_symbol: "SPXW  260313P06630000".to_string(),
+                last_trade_date_or_contract_month: "20260313".to_string(),
+                right: Some(OptionRight::Put),
+                strike: 6630.0,
+                multiplier: "100".to_string(),
+                ..Default::default()
+            },
+            min_tick: 0.05,
+            order_types: vec!["ALGO".to_string(), "LMT".to_string(), "MKT".to_string()],
+            under_symbol: "SPX".to_string(),
+            under_security_type: "IND".to_string(),
+            ..Default::default()
+        };
+
+        let instrument_id = InstrumentId::new(
+            NautilusSymbol::from("SPXW  260313P06630000"),
+            Venue::from("SMART"),
+        );
+
+        let instrument = parse_ib_contract_to_instrument(&details, instrument_id).unwrap();
+
+        let InstrumentAny::OptionContract(option) = instrument else {
+            panic!("expected option contract");
+        };
+
+        assert_eq!(
+            option.info.unwrap().get("orderTypes"),
+            Some(&serde_json::Value::from("ALGO,LMT,MKT"))
         );
     }
 
