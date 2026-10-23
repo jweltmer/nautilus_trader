@@ -2273,28 +2273,35 @@ impl InteractiveBrokersExecutionClient {
         }
     }
 
-    // Returns an error while disconnected, so the report hooks fall back to the inline path
-    // that reports the same error.
-    fn report_client(&self) -> anyhow::Result<IbReportClient> {
-        let client = self.ib_client.as_ref().context("IB client not connected")?;
-
-        Ok(IbReportClient::new(
-            client.as_arc().clone(),
-            IbReportContext::new(Arc::clone(&self.instrument_provider), self.core.account_id),
-            self.ib_account,
-            Duration::from_secs(self.config.request_timeout),
-        ))
-    }
-
+    // An order with an execution missing its commission report is left out, with its fills, so
+    // startup does not infer the missing execution from the order report, at a price taken from
+    // the fills that do have commissions. Position reports and the other orders stay, so
+    // reconciliation restores the position or leaves it unresolved.
     pub(super) fn assemble_mass_status(
         &self,
         ts_now: UnixNanos,
         start: Option<UnixNanos>,
         order_collection: OrderStatusCollection,
-        fill_evidence: FillEvidence,
+        mut fill_evidence: FillEvidence,
         mut position_reports: Vec<PositionStatusReport>,
     ) -> ExecutionMassStatus {
         let mut order_reports = order_collection.reports;
+        let deferred_orders: AHashSet<VenueOrderId> = fill_evidence
+            .missing_commissions
+            .iter()
+            .map(|missing| missing.venue_order_id)
+            .collect();
+
+        if !deferred_orders.is_empty() {
+            tracing::warn!(
+                orders = ?deferred_orders,
+                "Deferring IB orders with executions missing commission reports",
+            );
+            order_reports.retain(|report| !deferred_orders.contains(&report.venue_order_id));
+            fill_evidence
+                .reports
+                .retain(|report| !deferred_orders.contains(&report.venue_order_id));
+        }
 
         tracing::info!(
             "generate_mass_status: {} order reports, {} fill reports, {} position reports",
@@ -2312,11 +2319,13 @@ impl InteractiveBrokersExecutionClient {
         );
         // IB `reqExecutions` and completed orders are session-scoped, so without a
         // configured lookback the actual venue bound is unknown and the report set
-        // cannot be claimed complete. Nor can it when a completed order was left out
-        // because its contract did not resolve.
+        // cannot be claimed complete. Nor can it when an order was deferred, or a completed order
+        // was left out because its contract did not resolve.
         mass_status.set_report_window(
             start,
-            start.is_some() && order_collection.unresolved.is_empty(),
+            start.is_some()
+                && fill_evidence.missing_commissions.is_empty()
+                && order_collection.unresolved.is_empty(),
         );
 
         parse::fill_missing_avg_px(&mut order_reports, &fill_evidence.reports);
@@ -2331,6 +2340,19 @@ impl InteractiveBrokersExecutionClient {
         mass_status.add_position_reports(position_reports);
 
         mass_status
+    }
+
+    // Returns an error while disconnected, so the report hooks fall back to the inline path
+    // that reports the same error.
+    fn report_client(&self) -> anyhow::Result<IbReportClient> {
+        let client = self.ib_client.as_ref().context("IB client not connected")?;
+
+        Ok(IbReportClient::new(
+            client.as_arc().clone(),
+            IbReportContext::new(Arc::clone(&self.instrument_provider), self.core.account_id),
+            self.ib_account,
+            Duration::from_secs(self.config.request_timeout),
+        ))
     }
 
     pub(super) fn execution_filter(ib_account: Ustr, start: Option<UnixNanos>) -> ExecutionFilter {
