@@ -392,6 +392,7 @@ fn build_engine(
             .liquidation_enabled(venue_config.liquidation_enabled())
             .liquidation_trigger_ratio(venue_config.liquidation_trigger_ratio())
             .liquidation_cancel_open_orders(venue_config.liquidation_cancel_open_orders())
+            .retire_expired_instruments(venue_config.retire_expired_instruments())
             .build()?;
         engine.add_venue(sim_config)?;
     }

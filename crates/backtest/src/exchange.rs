@@ -23,7 +23,7 @@ use std::{
     rc::Rc,
 };
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use indexmap::IndexMap;
 use nautilus_common::{
     cache::Cache,
@@ -205,6 +205,15 @@ pub struct SimulatedExchange {
     liquidation_enabled: bool,
     liquidation_trigger_ratio: f64,
     liquidation_cancel_open_orders: bool,
+    retire_expired_instruments: bool,
+    retired_instruments: AHashMap<InstrumentId, RetiredInstrument>,
+}
+
+/// What a retired instrument keeps so its matching engine can be restored unchanged.
+#[derive(Debug)]
+struct RetiredInstrument {
+    raw_id: u32,
+    initial_instrument: Option<InstrumentAny>,
 }
 
 impl Debug for SimulatedExchange {
@@ -298,6 +307,8 @@ impl SimulatedExchange {
             liquidation_enabled: config.liquidation_enabled,
             liquidation_trigger_ratio: config.liquidation_trigger_ratio,
             liquidation_cancel_open_orders: config.liquidation_cancel_open_orders,
+            retire_expired_instruments: config.retire_expired_instruments,
+            retired_instruments: AHashMap::new(),
         })
     }
 
@@ -393,7 +404,8 @@ impl SimulatedExchange {
     /// Returns whether `instrument` is already registered with this exchange, failing when its
     /// ID is registered with a different definition.
     ///
-    /// Definitions are compared without their event timestamps.
+    /// Definitions are compared without their event timestamps. A retired instrument stays
+    /// registered, and is compared against its cached definition.
     ///
     /// # Errors
     ///
@@ -403,13 +415,26 @@ impl SimulatedExchange {
         &self,
         instrument: &InstrumentAny,
     ) -> anyhow::Result<bool> {
-        match self.instruments.get(&instrument.id()) {
-            None => Ok(false),
-            Some(existing) if instrument_definitions_match(existing, instrument) => Ok(true),
-            Some(_) => anyhow::bail!(
-                "Instrument {} is already registered with a different definition",
-                instrument.id()
-            ),
+        let instrument_id = instrument.id();
+        let cached;
+        let existing = match self.instruments.get(&instrument_id) {
+            Some(existing) => existing,
+            None if self.retired_instruments.contains_key(&instrument_id) => {
+                cached = self.cache.borrow().instrument(&instrument_id).cloned();
+                match &cached {
+                    Some(existing) => existing,
+                    None => return Ok(true),
+                }
+            }
+            None => return Ok(false),
+        };
+
+        if instrument_definitions_match(existing, instrument) {
+            Ok(true)
+        } else {
+            anyhow::bail!(
+                "Instrument {instrument_id} is already registered with a different definition"
+            )
         }
     }
 
@@ -482,6 +507,7 @@ impl SimulatedExchange {
         .expect_display(FAILED);
 
         if self.is_instrument_registered(&instrument)? {
+            self.ensure_matching_engine(instrument.id());
             return Ok(());
         }
 
@@ -494,6 +520,21 @@ impl SimulatedExchange {
             anyhow::bail!("Cash account cannot trade futures or perpetuals")
         }
 
+        let instrument_id = instrument.id();
+        let raw_id = self
+            .last_raw_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("matching engine raw ID exhausted at u32::MAX"))?;
+        self.last_raw_id = raw_id;
+        let matching_engine = self.new_matching_engine(instrument.clone(), raw_id);
+        self.instruments.insert(instrument_id, instrument);
+        self.matching_engines.insert(instrument_id, matching_engine);
+
+        log::info!("Added instrument {instrument_id} and created matching engine");
+        Ok(())
+    }
+
+    fn new_matching_engine(&self, instrument: InstrumentAny, raw_id: u32) -> OrderMatchingEngine {
         let price_protection = if self.price_protection_points == 0 {
             None
         } else {
@@ -518,14 +559,8 @@ impl SimulatedExchange {
             .defer_option_settlement(self.defer_option_settlement)
             .maybe_price_protection_points(price_protection)
             .build();
-        let instrument_id = instrument.id();
-        let raw_id = self
-            .last_raw_id
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("matching engine raw ID exhausted at u32::MAX"))?;
-        self.last_raw_id = raw_id;
         let mut matching_engine = OrderMatchingEngine::new(
-            instrument.clone(),
+            instrument,
             raw_id,
             self.fill_model.clone(),
             self.fee_model.clone(),
@@ -540,18 +575,15 @@ impl SimulatedExchange {
         if let Some(handler) = &self.event_handler {
             matching_engine.set_event_handler(Rc::clone(handler));
         }
-        self.instruments.insert(instrument_id, instrument);
         matching_engine.set_inflight_orders(self.inflight_orders.clone());
         matching_engine.set_matching_orders(self.matching_orders.clone());
-        self.matching_engines.insert(instrument_id, matching_engine);
-
-        log::info!("Added instrument {instrument_id} and created matching engine");
-        Ok(())
+        matching_engine
     }
 
     /// Applies replay definitions using the existing matching engine lifecycle.
     pub(crate) fn update_instrument(&mut self, instrument: &InstrumentAny) -> anyhow::Result<()> {
         let instrument_id = instrument.id();
+        self.ensure_matching_engine(instrument_id);
         if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
             anyhow::ensure!(
                 instrument.expiration_ns() == engine.instrument.expiration_ns()
@@ -881,6 +913,10 @@ impl SimulatedExchange {
     }
 
     /// Processes instrument expirations due at the given timestamp.
+    ///
+    /// When the venue retires expired instruments, this then retires every instrument whose
+    /// expiration has been processed and which [`Self::retire_instrument`] accepts. An
+    /// instrument that is not yet safe to retire is retried on the next expiration pass.
     pub fn process_instrument_expirations(&mut self, ts_now: UnixNanos) {
         for matching_engine in self.matching_engines.values_mut() {
             if matching_engine
@@ -893,6 +929,213 @@ impl SimulatedExchange {
         }
 
         self.drain_oto_commands();
+
+        if self.retire_expired_instruments {
+            self.retire_settled_instruments(ts_now);
+        }
+    }
+
+    /// Retires an expired instrument, dropping its matching engine and keeping only what is
+    /// needed to restore it.
+    ///
+    /// The instrument must have reached its expiration time and had its expiration processed,
+    /// must not be a binary option, and the venue must hold no open or unsettled orders, open
+    /// positions, pending fills, queued or inflight commands, or pending funding rates for it.
+    /// The cache is left untouched.
+    ///
+    /// A retired instrument stays registered. A later command, market data, replayed
+    /// definition or reset for it restores its matching engine from the cached definition,
+    /// with its original raw ID and position, and expired as before, so results match a run
+    /// without retirement while the cache keeps the definition. The restored engine starts
+    /// with an empty order book.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the instrument has no matching engine or is not safe to retire.
+    pub fn retire_instrument(&mut self, instrument_id: InstrumentId) -> anyhow::Result<()> {
+        let ts_now = self.clock.borrow().timestamp_ns();
+        self.check_retirable(instrument_id, ts_now)?;
+        if let Some(engine) = self.matching_engines.shift_remove(&instrument_id) {
+            self.store_retired(instrument_id, engine.raw_id);
+        }
+        log::debug!("Retired instrument {instrument_id}");
+        Ok(())
+    }
+
+    /// Returns the number of instruments currently retired.
+    #[must_use]
+    pub fn retired_instrument_count(&self) -> usize {
+        self.retired_instruments.len()
+    }
+
+    fn retire_settled_instruments(&mut self, ts_now: UnixNanos) {
+        let candidates: Vec<(InstrumentId, u32)> = self
+            .matching_engines
+            .iter()
+            .filter(|(_, engine)| engine.is_expiration_processed())
+            .map(|(instrument_id, engine)| (*instrument_id, engine.raw_id))
+            .collect();
+
+        let mut retired = AHashSet::new();
+        for (instrument_id, raw_id) in candidates {
+            match self.check_retirable(instrument_id, ts_now) {
+                Ok(()) => {
+                    retired.insert(instrument_id);
+                    self.store_retired(instrument_id, raw_id);
+                }
+                Err(e) => log::debug!("Deferring retirement: {e}"),
+            }
+        }
+
+        if retired.is_empty() {
+            return;
+        }
+
+        // Retain preserves the remaining engines' order, so iteration stays deterministic
+        self.matching_engines
+            .retain(|instrument_id, _| !retired.contains(instrument_id));
+        log::debug!("Retired {} expired instruments", retired.len());
+    }
+
+    fn check_retirable(
+        &mut self,
+        instrument_id: InstrumentId,
+        ts_now: UnixNanos,
+    ) -> anyhow::Result<()> {
+        let Some(engine) = self.matching_engines.get_mut(&instrument_id) else {
+            anyhow::bail!("Cannot retire {instrument_id}: no matching engine");
+        };
+        anyhow::ensure!(
+            engine.is_expiration_processed(),
+            "Cannot retire {instrument_id}: expiration has not been processed"
+        );
+        // A restored engine re-expires on its expiration time, so only instruments past it
+        // can be restored unchanged; binary options settle on resolution instead
+        anyhow::ensure!(
+            engine
+                .instrument
+                .expiration_ns()
+                .is_some_and(|ns| ns != UnixNanos::default() && ns <= ts_now)
+                && !matches!(engine.instrument, InstrumentAny::BinaryOption(_)),
+            "Cannot retire {instrument_id}: expiration time has not been reached"
+        );
+        anyhow::ensure!(
+            !engine.has_pending_fills(),
+            "Cannot retire {instrument_id}: fills are pending"
+        );
+        anyhow::ensure!(
+            !self
+                .message_queue
+                .iter()
+                .any(|command| command.instrument_id() == instrument_id)
+                && !self
+                    .inflight_queue
+                    .iter()
+                    .any(|inflight| inflight.command.instrument_id() == instrument_id),
+            "Cannot retire {instrument_id}: commands are queued or inflight"
+        );
+        anyhow::ensure!(
+            !self
+                .pending_funding_rates
+                .keys()
+                .any(|(_, id)| *id == instrument_id),
+            "Cannot retire {instrument_id}: funding rates are pending"
+        );
+
+        let cache = self.cache.borrow();
+        anyhow::ensure!(
+            cache
+                .orders(Some(&self.id), Some(&instrument_id), None, None, None)
+                .iter()
+                .all(|order| order.is_closed()),
+            "Cannot retire {instrument_id}: orders are not closed"
+        );
+        anyhow::ensure!(
+            !cache.has_positions_open(Some(&self.id), Some(&instrument_id), None, None, None),
+            "Cannot retire {instrument_id}: positions are open"
+        );
+        Ok(())
+    }
+
+    fn store_retired(&mut self, instrument_id: InstrumentId, raw_id: u32) {
+        self.instruments.remove(&instrument_id);
+        let initial_instrument = self.initial_instruments.remove(&instrument_id);
+        self.retired_instruments.insert(
+            instrument_id,
+            RetiredInstrument {
+                raw_id,
+                initial_instrument,
+            },
+        );
+    }
+
+    // Restores any retired matching engine a command needs, returning false when one cannot
+    // be restored because its definition is no longer cached
+    fn restore_command_engines(&mut self, command: &TradingCommand) -> bool {
+        let mut instrument_ids = vec![command.instrument_id()];
+        if let TradingCommand::SubmitOrderList(command) = command {
+            let cache = self.cache.borrow();
+            instrument_ids.extend(
+                command
+                    .order_list
+                    .client_order_ids
+                    .iter()
+                    .filter_map(|id| cache.order(id).map(|order| order.instrument_id())),
+            );
+        }
+
+        for instrument_id in instrument_ids {
+            if !self.ensure_matching_engine(instrument_id)
+                && self.retired_instruments.contains_key(&instrument_id)
+            {
+                log::error!(
+                    "Cannot process command for retired instrument {instrument_id}: definition is no longer cached"
+                );
+                return false;
+            }
+        }
+        true
+    }
+
+    // Returns whether the instrument has a matching engine, restoring a retired one
+    fn ensure_matching_engine(&mut self, instrument_id: InstrumentId) -> bool {
+        self.matching_engines.contains_key(&instrument_id)
+            || self.restore_retired_instrument(instrument_id)
+    }
+
+    // Rebuilds a retired instrument's matching engine from its cached definition at its
+    // original raw ID and position, and re-processes its expiration so the engine closes its
+    // market and rejects orders as it did before retirement
+    fn restore_retired_instrument(&mut self, instrument_id: InstrumentId) -> bool {
+        if !self.retired_instruments.contains_key(&instrument_id) {
+            return false;
+        }
+        let Some(instrument) = self.cache.borrow().instrument(&instrument_id).cloned() else {
+            return false;
+        };
+        let Some(retired) = self.retired_instruments.remove(&instrument_id) else {
+            return false;
+        };
+
+        let mut engine = self.new_matching_engine(instrument.clone(), retired.raw_id);
+        engine.process_instrument_expiration(self.clock.borrow().timestamp_ns());
+
+        // Engines are inserted in raw ID order, so this restores the original iteration order
+        let index = self
+            .matching_engines
+            .binary_search_by(|_, other| other.raw_id.cmp(&retired.raw_id))
+            .unwrap_or_else(|index| index);
+        self.matching_engines
+            .shift_insert(index, instrument_id, engine);
+        self.instruments.insert(instrument_id, instrument);
+
+        if let Some(initial_instrument) = retired.initial_instrument {
+            self.initial_instruments
+                .insert(instrument_id, initial_instrument);
+        }
+
+        log::debug!("Restored retired instrument {instrument_id}");
+        true
     }
 
     /// Returns unprocessed instrument expirations for timer scheduling.
@@ -1924,13 +2167,23 @@ impl SimulatedExchange {
     ///
     /// # Errors
     ///
-    /// Returns an error if a simulation module cannot reset.
+    /// Returns an error if a simulation module cannot reset, or a retired instrument cannot be
+    /// restored because its definition is no longer cached.
     pub fn reset(&mut self) -> anyhow::Result<()> {
         if !self.account_at_starting_balances() {
             self.generate_fresh_account_state();
         }
 
         let mut callback_error = None;
+
+        let retired: Vec<InstrumentId> = self.retired_instruments.keys().copied().collect();
+        for instrument_id in retired {
+            if !self.restore_retired_instrument(instrument_id) {
+                callback_error.get_or_insert_with(|| {
+                    format!("Cannot restore retired instrument {instrument_id}: definition is no longer cached")
+                });
+            }
+        }
 
         for (module_index, module) in self.modules.iter().enumerate() {
             if let Err(e) = module.reset()
@@ -2099,7 +2352,14 @@ impl SimulatedExchange {
     }
 
     fn process_trading_command(&mut self, command: TradingCommand) {
+        // Restore while the command's orders are still tracked as inflight, so a restored
+        // engine's re-expiry leaves them to their own rejection rather than canceling them
+        let restored = self.restore_command_engines(&command);
         self.inflight_orders.remove(&command);
+
+        if !restored {
+            return;
+        }
         let instrument_id = command.instrument_id();
         assert!(
             self.matching_engines.contains_key(&instrument_id),
@@ -2896,6 +3156,132 @@ mod tests {
         ] {
             assert_eq!(instrument.expiration_ns(), original.expiration_ns());
         }
+    }
+
+    fn expiring_option(symbol: &str, expiration_offset_ns: u64) -> InstrumentAny {
+        let mut option = nautilus_model::instruments::stubs::option_contract_appl();
+        option.id = InstrumentId::from(symbol);
+        option.expiration_ns =
+            UnixNanos::from(option.expiration_ns.as_u64() + expiration_offset_ns);
+        InstrumentAny::OptionContract(option)
+    }
+
+    #[rstest]
+    fn test_expiration_retires_expired_instruments_when_enabled(
+        #[values(false, true)] retire: bool,
+        audusd_sim: CurrencyPair,
+    ) {
+        let mut exchange = setup_exchange(Dispatch::Queued);
+        exchange.retire_expired_instruments = retire;
+        let spot = InstrumentAny::CurrencyPair(audusd_sim);
+        let early = expiring_option("EARLY.SIM", 0);
+        let late = expiring_option("LATE.SIM", 1);
+        for instrument in [&early, &spot, &late] {
+            exchange.add_instrument(instrument.clone()).unwrap();
+        }
+        exchange
+            .cache
+            .borrow_mut()
+            .add_instrument(early.clone())
+            .unwrap();
+        let ts_expired = early.expiration_ns().unwrap();
+        exchange.set_clock_time(ts_expired);
+
+        exchange.process_instrument_expirations(ts_expired);
+
+        let remaining: Vec<InstrumentId> = exchange.matching_engines.keys().copied().collect();
+        if retire {
+            // Retirement keeps the surviving engines in insertion order
+            assert_eq!(remaining, vec![spot.id(), late.id()]);
+            assert!(!exchange.instruments.contains_key(&early.id()));
+            assert_eq!(exchange.retired_instrument_count(), 1);
+            assert!(exchange.is_instrument_registered(&early).unwrap());
+
+            // Market data restores the engine at its raw ID and position, expired as before
+            exchange
+                .process_quote_tick(&QuoteTick::new(
+                    early.id(),
+                    Price::from("1.00"),
+                    Price::from("1.01"),
+                    Quantity::from("1"),
+                    Quantity::from("1"),
+                    ts_expired,
+                    ts_expired,
+                ))
+                .unwrap();
+            assert_eq!(exchange.retired_instrument_count(), 0);
+        } else {
+            assert_eq!(remaining, vec![early.id(), spot.id(), late.id()]);
+        }
+
+        let engine = &exchange.matching_engines[&early.id()];
+        assert_eq!(engine.raw_id, 1);
+        assert!(engine.is_expiration_processed());
+        assert_eq!(exchange.matching_engines.get_index_of(&early.id()), Some(0));
+
+        // Retirement does not shift the raw IDs of later engines
+        let next = expiring_option("NEXT.SIM", 2);
+        exchange.add_instrument(next.clone()).unwrap();
+        assert_eq!(exchange.matching_engines[&next.id()].raw_id, 4);
+    }
+
+    #[rstest]
+    fn test_retire_instrument_refuses_unsafe_instrument() {
+        let mut exchange = setup_exchange(Dispatch::Queued);
+        let option = expiring_option("TEST.SIM", 0);
+        let instrument_id = option.id();
+        exchange.add_instrument(option.clone()).unwrap();
+        let reason = |exchange: &mut SimulatedExchange, instrument_id| {
+            exchange
+                .retire_instrument(instrument_id)
+                .unwrap_err()
+                .to_string()
+        };
+
+        assert!(
+            reason(&mut exchange, InstrumentId::from("OTHER.SIM")).contains("no matching engine")
+        );
+        assert!(reason(&mut exchange, instrument_id).contains("expiration has not been processed"));
+
+        exchange.process_instrument_expirations(option.expiration_ns().unwrap());
+        assert!(
+            reason(&mut exchange, instrument_id).contains("expiration time has not been reached")
+        );
+
+        exchange.set_clock_time(option.expiration_ns().unwrap());
+        exchange
+            .message_queue
+            .push_back(TradingCommand::QueryOrder(QueryOrder::new(
+                TraderId::test_default(),
+                None,
+                StrategyId::test_default(),
+                instrument_id,
+                ClientOrderId::from("O-001"),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            )));
+        assert!(reason(&mut exchange, instrument_id).contains("commands are queued or inflight"));
+
+        exchange.message_queue.clear();
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument_id)
+            .client_order_id(ClientOrderId::from("O-RETIRE"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1"))
+            .price(Price::from("1.00"))
+            .build();
+        exchange
+            .cache
+            .borrow_mut()
+            .add_order(order, None, None, false)
+            .unwrap();
+        assert!(reason(&mut exchange, instrument_id).contains("orders are not closed"));
+
+        assert!(exchange.matching_engines.contains_key(&instrument_id));
+        assert_eq!(exchange.retired_instrument_count(), 0);
     }
 
     #[rstest]

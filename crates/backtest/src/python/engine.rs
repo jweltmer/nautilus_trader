@@ -131,6 +131,14 @@ impl PyBacktestEngine {
     /// - `liquidation_cancel_open_orders` (bool, default `True`): if open resting
     ///   orders for the venue should be cancelled before synthetic close-out fills
     ///   are emitted for open positions.
+    ///
+    /// # Instrument retirement
+    ///
+    /// - `retire_expired_instruments` (bool, default `False`): if instruments should be
+    ///   retired from the exchange once their expiration has been processed and nothing
+    ///   remains open for them, bounding exchange memory by the unexpired instruments. A
+    ///   retired instrument's matching engine is restored from the cache if it is needed
+    ///   again, including on reset.
     #[pyo3(
         name = "add_venue",
         signature = (
@@ -169,6 +177,7 @@ impl PyBacktestEngine {
             liquidation_trigger_ratio = None,
             liquidation_cancel_open_orders = true,
             order_priority_reset_policy = OrderPriorityResetPolicy::PriceChange,
+            retire_expired_instruments = false,
         )
     )]
     #[expect(
@@ -213,6 +222,7 @@ impl PyBacktestEngine {
         liquidation_trigger_ratio: Option<f64>,
         liquidation_cancel_open_orders: bool,
         order_priority_reset_policy: OrderPriorityResetPolicy,
+        retire_expired_instruments: bool,
     ) -> PyResult<()> {
         let leverages: AHashMap<InstrumentId, Decimal> = leverages
             .map(|m| m.into_iter().collect())
@@ -288,6 +298,7 @@ impl PyBacktestEngine {
             .liquidation_enabled(liquidation_enabled)
             .liquidation_trigger_ratio(liquidation_trigger_ratio.unwrap_or(1.0))
             .liquidation_cancel_open_orders(liquidation_cancel_open_orders)
+            .retire_expired_instruments(retire_expired_instruments)
             .build()
             .map_err(config_error_to_pyvalue_err)?;
 
@@ -338,6 +349,17 @@ impl PyBacktestEngine {
         let instrument_any = pyobject_to_instrument_any(py, instrument)?;
         self.0
             .add_instrument(&instrument_any)
+            .map_err(to_pyruntime_err)
+    }
+
+    /// Retires an expired instrument from its venue's simulated exchange.
+    ///
+    /// The instrument must be past its expiration time with its expiration processed, and
+    /// nothing may remain open for it at the venue. The cache is left untouched.
+    #[pyo3(name = "retire_instrument")]
+    fn py_retire_instrument(&mut self, instrument_id: InstrumentId) -> PyResult<()> {
+        self.0
+            .retire_instrument(instrument_id)
             .map_err(to_pyruntime_err)
     }
 
@@ -1854,6 +1876,7 @@ mod model_tests {
                     None,
                     true,
                     OrderPriorityResetPolicy::PriceChange,
+                    false,
                 )
                 .unwrap();
 

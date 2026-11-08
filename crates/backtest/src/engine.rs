@@ -399,6 +399,25 @@ impl BacktestEngine {
         Ok(())
     }
 
+    /// Retires an expired instrument from its venue's simulated exchange.
+    ///
+    /// See [`SimulatedExchange::retire_instrument`] for when an instrument is safe to retire.
+    /// The cache is left untouched, so the caller decides whether to also purge it there.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the instrument's venue has not been added, or the exchange refuses
+    /// to retire the instrument.
+    pub fn retire_instrument(&mut self, instrument_id: InstrumentId) -> anyhow::Result<()> {
+        let Some(exchange) = self.venues.get(&instrument_id.venue) else {
+            anyhow::bail!(
+                "Cannot retire {instrument_id}: venue {} has not been added",
+                instrument_id.venue
+            );
+        };
+        exchange.borrow_mut().retire_instrument(instrument_id)
+    }
+
     /// Adds data to the engine for replay during the backtest run.
     ///
     /// # Errors
@@ -4784,6 +4803,139 @@ mod tests {
             matching.instrument.expiration_ns(),
             original.expiration_ns()
         );
+    }
+
+    fn expiring_option(symbol: &str, expiration_ns: u64) -> InstrumentAny {
+        let mut option = nautilus_model::instruments::stubs::option_contract_appl();
+        option.id = InstrumentId::from(symbol);
+        option.activation_ns = UnixNanos::default();
+        option.expiration_ns = UnixNanos::from(expiration_ns);
+        InstrumentAny::OptionContract(option)
+    }
+
+    #[rstest]
+    fn test_expiration_timers_retire_expired_instruments(#[values(false, true)] retire: bool) {
+        let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        let venue_config = SimulatedVenueConfig::builder()
+            .venue(Venue::from("BINANCE"))
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Margin)
+            .book_type(BookType::L1_MBP)
+            .starting_balances(vec![Money::from("1_000_000 USDT")])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .retire_expired_instruments(retire)
+            .build()
+            .unwrap();
+        engine.add_venue(venue_config).unwrap();
+
+        let perpetual = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let early = expiring_option("EARLY.BINANCE", 10);
+        let late = expiring_option("LATE.BINANCE", 20);
+        for instrument in [&early, &perpetual, &late] {
+            engine.add_instrument(instrument).unwrap();
+        }
+        let quote = QuoteTick::new(
+            perpetual.id(),
+            Price::from("1000.00"),
+            Price::from("1001.00"),
+            Quantity::from("1.000"),
+            Quantity::from("1.000"),
+            25.into(),
+            25.into(),
+        );
+        engine
+            .add_data(vec![Data::Quote(quote)], None, true, true)
+            .unwrap();
+
+        engine.run(None, None, None, false).unwrap();
+
+        let exchange = Rc::clone(&engine.venues[&perpetual.id().venue]);
+        let engine_ids = |exchange: &Rc<RefCell<SimulatedExchange>>| -> Vec<InstrumentId> {
+            exchange
+                .borrow()
+                .get_matching_engines()
+                .keys()
+                .copied()
+                .collect()
+        };
+
+        if retire {
+            assert_eq!(engine_ids(&exchange), vec![perpetual.id()]);
+            assert_eq!(exchange.borrow().retired_instrument_count(), 2);
+
+            // A command for a retired instrument restores its engine where it was
+            exchange
+                .borrow_mut()
+                .send(TradingCommand::CancelAllOrders(CancelAllOrders::new(
+                    engine.trader_id(),
+                    None,
+                    StrategyId::from("S-001"),
+                    early.id(),
+                    None,
+                    UUID4::new(),
+                    30.into(),
+                    None,
+                    None,
+                )));
+            exchange.borrow_mut().process(30.into());
+            assert_eq!(engine_ids(&exchange), vec![early.id(), perpetual.id()]);
+            let raw_id = exchange
+                .borrow()
+                .get_matching_engine(&early.id())
+                .unwrap()
+                .raw_id;
+            assert_eq!(raw_id, 1);
+
+            // A queued submit for a retired instrument is rejected, as without retirement,
+            // rather than canceled by the restored engine's re-expiry
+            let order = OrderTestBuilder::new(OrderType::Limit)
+                .trader_id(engine.trader_id())
+                .instrument_id(late.id())
+                .side(OrderSide::Buy)
+                .price(Price::from("1.00"))
+                .quantity(Quantity::from("1"))
+                .submit(true)
+                .build();
+            let cache = engine.kernel.cache();
+            cache
+                .borrow_mut()
+                .add_order(order.clone(), None, None, false)
+                .unwrap();
+            exchange
+                .borrow_mut()
+                .send(TradingCommand::SubmitOrder(create_submit_order_command(
+                    &order,
+                )));
+            exchange.borrow_mut().process(30.into());
+            assert_eq!(
+                cache
+                    .borrow()
+                    .order(&order.client_order_id())
+                    .unwrap()
+                    .status(),
+                OrderStatus::Rejected
+            );
+
+            // Reset restores every retired engine in its original order
+            engine.reset().unwrap();
+            assert_eq!(exchange.borrow().retired_instrument_count(), 0);
+        } else {
+            assert_eq!(exchange.borrow().retired_instrument_count(), 0);
+
+            // Callers which own the lifecycle can retire explicitly
+            engine.retire_instrument(early.id()).unwrap();
+            assert_eq!(engine_ids(&exchange), vec![perpetual.id(), late.id()]);
+            engine.reset().unwrap();
+        }
+        assert_eq!(
+            engine_ids(&exchange),
+            vec![early.id(), perpetual.id(), late.id()]
+        );
+
+        // The cache keeps the definitions either way
+        let cache = engine.kernel.cache();
+        assert!(cache.borrow().instrument(&early.id()).is_some());
+        assert!(cache.borrow().instrument(&late.id()).is_some());
     }
 
     fn replay_binary_option(expiration_ns: u64, price_increment: &str) -> BinaryOption {

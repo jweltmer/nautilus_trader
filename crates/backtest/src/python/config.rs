@@ -326,6 +326,7 @@ impl BacktestVenueConfig {
         liquidation_trigger_ratio = None,
         liquidation_cancel_open_orders = None,
         order_priority_reset_policy = None,
+        retire_expired_instruments = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -369,6 +370,7 @@ impl BacktestVenueConfig {
         liquidation_trigger_ratio: Option<f64>,
         liquidation_cancel_open_orders: Option<bool>,
         order_priority_reset_policy: Option<OrderPriorityResetPolicy>,
+        retire_expired_instruments: Option<bool>,
     ) -> pyo3::PyResult<Self> {
         let oms_type = enum_from_python(oms_type)?;
         let account_type = enum_from_python(account_type)?;
@@ -437,6 +439,7 @@ impl BacktestVenueConfig {
             .maybe_liquidation_enabled(liquidation_enabled)
             .maybe_liquidation_trigger_ratio(liquidation_trigger_ratio)
             .maybe_liquidation_cancel_open_orders(liquidation_cancel_open_orders)
+            .maybe_retire_expired_instruments(retire_expired_instruments)
             .build()
             .map_err(config_error_to_pyvalue_err)
     }
@@ -659,6 +662,12 @@ impl BacktestVenueConfig {
     #[pyo3(name = "liquidation_cancel_open_orders")]
     fn py_liquidation_cancel_open_orders(&self) -> bool {
         self.liquidation_cancel_open_orders()
+    }
+
+    #[getter]
+    #[pyo3(name = "retire_expired_instruments")]
+    fn py_retire_expired_instruments(&self) -> bool {
+        self.retire_expired_instruments()
     }
 
     fn __repr__(&self) -> String {

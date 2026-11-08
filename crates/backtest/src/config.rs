@@ -364,6 +364,10 @@ pub struct SimulatedVenueConfig {
     /// If open orders are canceled before liquidating positions.
     #[builder(default = true)]
     pub liquidation_cancel_open_orders: bool,
+    /// If instruments are retired from the exchange once their expiration has been processed
+    /// and nothing remains open for them.
+    #[builder(default = false)]
+    pub retire_expired_instruments: bool,
     /// The queue-priority reset policy for successful modify commands.
     #[builder(default)]
     pub order_priority_reset_policy: OrderPriorityResetPolicy,
@@ -549,6 +553,10 @@ pub struct BacktestVenueConfig {
     /// If open orders should be canceled before closing positions during liquidation.
     #[builder(default = true)]
     liquidation_cancel_open_orders: bool,
+    /// If instruments should be retired from the exchange once their expiration has been
+    /// processed and nothing remains open for them.
+    #[builder(default)]
+    retire_expired_instruments: bool,
     #[builder(default)]
     order_priority_reset_policy: OrderPriorityResetPolicy,
 }
@@ -797,6 +805,11 @@ impl BacktestVenueConfig {
     #[must_use]
     pub fn liquidation_cancel_open_orders(&self) -> bool {
         self.liquidation_cancel_open_orders
+    }
+
+    #[must_use]
+    pub fn retire_expired_instruments(&self) -> bool {
+        self.retire_expired_instruments
     }
 }
 
