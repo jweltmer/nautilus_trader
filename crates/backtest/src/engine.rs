@@ -401,6 +401,25 @@ impl BacktestEngine {
         Ok(())
     }
 
+    /// Retires an expired instrument from its venue's simulated exchange.
+    ///
+    /// See [`SimulatedExchange::retire_instrument`] for when an instrument is safe to retire.
+    /// The cache is left untouched, so the caller decides whether to also purge it there.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the instrument's venue has not been added, or the exchange refuses
+    /// to retire the instrument.
+    pub fn retire_instrument(&mut self, instrument_id: InstrumentId) -> anyhow::Result<()> {
+        let Some(exchange) = self.venues.get(&instrument_id.venue) else {
+            anyhow::bail!(
+                "Cannot retire {instrument_id}: venue {} has not been added",
+                instrument_id.venue
+            );
+        };
+        exchange.borrow_mut().retire_instrument(instrument_id)
+    }
+
     /// Adds data to the engine for replay during the backtest run.
     ///
     /// # Errors
@@ -2748,18 +2767,19 @@ mod tests {
         types::{AccountBalance, MarginBalance},
     };
     use nautilus_model::{
-        data::{Data, IndexPriceUpdate, InstrumentClose, InstrumentStatus, QuoteTick},
+        data::{Data, IndexPriceUpdate, InstrumentClose, InstrumentStatus, QuoteTick, TradeTick},
         enums::{
-            AccountType, BookType, ContingencyType, InstrumentCloseType, LiquiditySide,
-            MarketStatus, MarketStatusAction, OmsType, OrderSide, OrderStatus, OrderType,
-            PositionSide, TriggerType,
+            AccountType, AggressorSide, AssetClass, BookType, ContingencyType, InstrumentCloseType,
+            LiquiditySide, MarketStatus, MarketStatusAction, OmsType, OptionKind, OrderSide,
+            OrderStatus, OrderType, PositionSide, SettlementType, TriggerType,
         },
         events::OrderEventAny,
         identifiers::{
-            AccountId, ActorId, ClientId, ClientOrderId, PositionId, StrategyId, TraderId, Venue,
+            AccountId, ActorId, ClientId, ClientOrderId, PositionId, StrategyId, Symbol, TradeId,
+            TraderId, Venue,
         },
         instruments::{
-            BinaryOption, CryptoPerpetual, Instrument, InstrumentAny,
+            BinaryOption, CryptoPerpetual, Equity, Instrument, InstrumentAny, OptionContract,
             stubs::{binary_option, crypto_perpetual_ethusdt},
         },
         orders::{
@@ -5252,6 +5272,455 @@ mod tests {
             matching.instrument.expiration_ns(),
             original.expiration_ns()
         );
+    }
+
+    fn expiring_option(symbol: &str, expiration_ns: u64) -> InstrumentAny {
+        let mut option = nautilus_model::instruments::stubs::option_contract_appl();
+        option.id = InstrumentId::from(symbol);
+        option.activation_ns = UnixNanos::default();
+        option.expiration_ns = UnixNanos::from(expiration_ns);
+        InstrumentAny::OptionContract(option)
+    }
+
+    #[rstest]
+    fn test_expiration_timers_retire_expired_instruments(#[values(false, true)] retire: bool) {
+        let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        let venue_config = SimulatedVenueConfig::builder()
+            .venue(Venue::from("BINANCE"))
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Margin)
+            .book_type(BookType::L1_MBP)
+            .starting_balances(vec![Money::from("1_000_000 USDT")])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .retire_expired_instruments(retire)
+            .build()
+            .unwrap();
+        engine.add_venue(venue_config).unwrap();
+
+        let perpetual = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let early = expiring_option("EARLY.BINANCE", 10);
+        let late = expiring_option("LATE.BINANCE", 20);
+        for instrument in [&early, &perpetual, &late] {
+            engine.add_instrument(instrument).unwrap();
+        }
+        let quote = QuoteTick::new(
+            perpetual.id(),
+            Price::from("1000.00"),
+            Price::from("1001.00"),
+            Quantity::from("1.000"),
+            Quantity::from("1.000"),
+            25.into(),
+            25.into(),
+        );
+        engine
+            .add_data(vec![Data::Quote(quote)], None, true, true)
+            .unwrap();
+
+        engine.run(None, None, None, false).unwrap();
+
+        let exchange = Rc::clone(&engine.venues[&perpetual.id().venue]);
+        let engine_ids = |exchange: &Rc<RefCell<SimulatedExchange>>| -> Vec<InstrumentId> {
+            exchange
+                .borrow()
+                .get_matching_engines()
+                .keys()
+                .copied()
+                .collect()
+        };
+
+        if retire {
+            assert_eq!(engine_ids(&exchange), vec![perpetual.id()]);
+            assert_eq!(exchange.borrow().retired_instrument_count(), 2);
+
+            // A command for a retired instrument restores its engine where it was
+            exchange
+                .borrow_mut()
+                .send(TradingCommand::CancelAllOrders(CancelAllOrders::new(
+                    engine.trader_id(),
+                    None,
+                    StrategyId::from("S-001"),
+                    early.id(),
+                    None,
+                    UUID4::new(),
+                    30.into(),
+                    None,
+                    None,
+                )));
+            exchange.borrow_mut().process(30.into());
+            assert_eq!(engine_ids(&exchange), vec![early.id(), perpetual.id()]);
+            let raw_id = exchange
+                .borrow()
+                .get_matching_engine(&early.id())
+                .unwrap()
+                .raw_id;
+            assert_eq!(raw_id, 1);
+
+            // A queued submit for a retired instrument is rejected, as without retirement,
+            // rather than canceled by the restored engine's re-expiry
+            let order = OrderTestBuilder::new(OrderType::Limit)
+                .trader_id(engine.trader_id())
+                .instrument_id(late.id())
+                .side(OrderSide::Buy)
+                .price(Price::from("1.00"))
+                .quantity(Quantity::from("1"))
+                .submit(true)
+                .build();
+            let cache = engine.kernel.cache();
+            cache
+                .borrow_mut()
+                .add_order(order.clone(), None, None, false)
+                .unwrap();
+            exchange
+                .borrow_mut()
+                .send(TradingCommand::SubmitOrder(create_submit_order_command(
+                    &order,
+                )));
+            exchange.borrow_mut().process(30.into());
+            assert_eq!(
+                cache
+                    .borrow()
+                    .order(&order.client_order_id())
+                    .unwrap()
+                    .status(),
+                OrderStatus::Rejected
+            );
+
+            // Reset restores every retired engine in its original order
+            engine.reset().unwrap();
+            assert_eq!(exchange.borrow().retired_instrument_count(), 0);
+        } else {
+            assert_eq!(exchange.borrow().retired_instrument_count(), 0);
+
+            // Callers which own the lifecycle can retire explicitly
+            engine.retire_instrument(early.id()).unwrap();
+            assert_eq!(engine_ids(&exchange), vec![perpetual.id(), late.id()]);
+            engine.reset().unwrap();
+        }
+        assert_eq!(
+            engine_ids(&exchange),
+            vec![early.id(), perpetual.id(), late.id()]
+        );
+
+        // The cache keeps the definitions either way
+        let cache = engine.kernel.cache();
+        assert!(cache.borrow().instrument(&early.id()).is_some());
+        assert!(cache.borrow().instrument(&late.id()).is_some());
+    }
+
+    // Buys each instrument on its first quote, and submits each late limit order once replay
+    // reaches its time
+    #[derive(Debug)]
+    struct BuyOnFirstQuoteStrategy {
+        core: StrategyCore,
+        instrument_ids: Vec<InstrumentId>,
+        late_orders: Vec<(UnixNanos, InstrumentId)>,
+        bought: Vec<InstrumentId>,
+        late_submitted: usize,
+    }
+
+    impl BuyOnFirstQuoteStrategy {
+        fn new(
+            instrument_ids: Vec<InstrumentId>,
+            late_orders: Vec<(UnixNanos, InstrumentId)>,
+        ) -> Self {
+            Self {
+                core: StrategyCore::new(StrategyConfig {
+                    strategy_id: Some(StrategyId::from("BUY-FIRST-001")),
+                    ..Default::default()
+                }),
+                instrument_ids,
+                late_orders,
+                bought: Vec::new(),
+                late_submitted: 0,
+            }
+        }
+    }
+
+    impl DataActor for BuyOnFirstQuoteStrategy {
+        fn on_start(&mut self) -> anyhow::Result<()> {
+            for instrument_id in self.instrument_ids.clone() {
+                self.subscribe_quotes(instrument_id, None, None);
+            }
+            Ok(())
+        }
+
+        fn on_reset(&mut self) -> anyhow::Result<()> {
+            self.bought.clear();
+            self.late_submitted = 0;
+            Ok(())
+        }
+
+        fn on_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
+            while let Some(&(ts_submit, instrument_id)) = self.late_orders.get(self.late_submitted)
+                && ts_submit <= quote.ts_init
+            {
+                self.late_submitted += 1;
+                let order = self.order().limit(
+                    instrument_id,
+                    OrderSide::Buy,
+                    Quantity::from(1),
+                    Price::from("1.00"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                self.submit_order(order, None, None, None)?;
+            }
+
+            if self.bought.contains(&quote.instrument_id) {
+                return Ok(());
+            }
+            self.bought.push(quote.instrument_id);
+            let order = self.order().market(
+                quote.instrument_id,
+                OrderSide::Buy,
+                Quantity::from(1),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            self.submit_order(order, None, None, None)
+        }
+    }
+
+    nautilus_strategy!(BuyOnFirstQuoteStrategy);
+
+    fn rolling_book_call(venue: Venue, strike: u32, expiration_ns: u64) -> InstrumentAny {
+        let symbol = Symbol::from(format!("AAPL-{expiration_ns}-C{strike}").as_str());
+        InstrumentAny::OptionContract(
+            OptionContract::builder()
+                .instrument_id(InstrumentId::new(symbol, venue))
+                .raw_symbol(symbol)
+                .asset_class(AssetClass::Equity)
+                .exchange(Ustr::from(venue.as_str()))
+                .underlying(Ustr::from("AAPL"))
+                .underlying_instrument_id(InstrumentId::new(Symbol::from("AAPL"), venue))
+                .settlement_type(SettlementType::Cash)
+                .option_kind(OptionKind::Call)
+                .strike_price(Price::new(f64::from(strike), 2))
+                .quote_currency(Currency::USD())
+                .settlement_currency(Currency::USD())
+                .strike_currency(Currency::USD())
+                .activation_ns(UnixNanos::default())
+                .expiration_ns(UnixNanos::from(expiration_ns))
+                .price_precision(2)
+                .price_increment(Price::from("0.01"))
+                .multiplier(Quantity::from(100))
+                .lot_size(Quantity::from(1))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
+    }
+
+    // A rolling book of cash-settled calls over consecutive expiries, alternating out of and
+    // into the money. The strategy buys every call and holds it to expiry, and retired calls
+    // are touched again by a late quote and by late orders, one after it retired again.
+    // Returns the engine and how many instruments it registered.
+    fn rolling_option_book_engine(venue: Venue, retire: bool) -> (BacktestEngine, usize) {
+        const EXPIRIES: u64 = 8;
+        const STRIKES: [u32; 5] = [140, 145, 150, 155, 160];
+        let expiry = |index: u64| (index + 1) * 1_000_000;
+
+        let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        let venue_config = SimulatedVenueConfig::builder()
+            .venue(venue)
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Margin)
+            .book_type(BookType::L1_MBP)
+            .starting_balances(vec![Money::from("1_000_000 USD")])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .retire_expired_instruments(retire)
+            .build()
+            .unwrap();
+        engine.add_venue(venue_config).unwrap();
+
+        let underlying = InstrumentAny::Equity(
+            Equity::builder()
+                .instrument_id(InstrumentId::new(Symbol::from("AAPL"), venue))
+                .raw_symbol(Symbol::from("AAPL"))
+                .currency(Currency::USD())
+                .price_precision(2)
+                .price_increment(Price::from("0.01"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        );
+        engine.add_instrument(&underlying).unwrap();
+
+        let quote = |instrument_id, ts: u64| {
+            Data::Quote(QuoteTick::new(
+                instrument_id,
+                Price::from("1.00"),
+                Price::from("1.10"),
+                Quantity::from(1),
+                Quantity::from(1),
+                ts.into(),
+                ts.into(),
+            ))
+        };
+        let mut calls = Vec::new();
+        let mut data = Vec::new();
+
+        for index in 0..EXPIRIES {
+            let spot = if index % 2 == 0 { "140.00" } else { "160.00" };
+            let ts_spot = expiry(index) - 300;
+            data.push(Data::Trade(TradeTick::new(
+                underlying.id(),
+                Price::from(spot),
+                Quantity::from(100),
+                AggressorSide::NoAggressor,
+                TradeId::from(format!("T-{index}").as_str()),
+                ts_spot.into(),
+                ts_spot.into(),
+            )));
+
+            for strike in STRIKES {
+                let call = rolling_book_call(venue, strike, expiry(index));
+                engine.add_instrument(&call).unwrap();
+                data.push(quote(call.id(), expiry(index) - 200));
+                calls.push(call.id());
+            }
+        }
+
+        let first_call = calls[2];
+        let second_call = calls[STRIKES.len() + 2];
+        data.push(quote(first_call, expiry(3) - 100));
+        let late_orders = vec![
+            (UnixNanos::from(expiry(4) - 200), second_call),
+            (UnixNanos::from(expiry(6) - 200), first_call),
+        ];
+        engine.add_data(data, None, true, true).unwrap();
+        engine
+            .add_strategy(BuyOnFirstQuoteStrategy::new(calls.clone(), late_orders))
+            .unwrap();
+
+        (engine, calls.len() + 1)
+    }
+
+    // Records orders, fills, positions and account states without their random IDs
+    fn trading_record(engine: &BacktestEngine, venue: Venue) -> Vec<String> {
+        let cache = engine.kernel.cache.borrow();
+        let mut orders: Vec<String> = cache
+            .orders(None, None, None, None, None)
+            .iter()
+            .map(|order| {
+                let events: Vec<_> = order
+                    .events()
+                    .into_iter()
+                    .map(|event| (event.event_type(), event.ts_event()))
+                    .collect();
+                let fills: Vec<_> = order
+                    .events()
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        OrderEventAny::Filled(fill) => {
+                            Some((fill.last_qty, fill.last_px, fill.position_id))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+
+                // Expiry settlement orders and fills take random IDs, so orders are keyed
+                // by what they did
+                format!(
+                    "{} {:?} {events:?} {fills:?}",
+                    order.instrument_id(),
+                    order.status(),
+                )
+            })
+            .collect();
+        orders.sort();
+
+        let mut positions: Vec<String> = cache
+            .positions(None, None, None, None, None)
+            .iter()
+            .map(|position| {
+                format!(
+                    "{} {} {} {:?} {} {:?}",
+                    position.id,
+                    position.instrument_id,
+                    position.peak_qty,
+                    position.realized_pnl,
+                    position.ts_opened,
+                    position.ts_closed,
+                )
+            })
+            .collect();
+        positions.sort();
+
+        let account = cache.account_for_venue(&venue).unwrap();
+        let states = account.events().into_iter().map(|state| {
+            let balances: Vec<_> = state
+                .balances
+                .iter()
+                .map(|balance| (balance.total, balance.locked, balance.free))
+                .collect();
+            let margins: Vec<_> = state
+                .margins
+                .iter()
+                .map(|margin| (margin.instrument_id, margin.initial, margin.maintenance))
+                .collect();
+            format!("{} {balances:?} {margins:?}", state.ts_event)
+        });
+
+        orders.into_iter().chain(positions).chain(states).collect()
+    }
+
+    #[rstest]
+    fn test_retiring_expired_instruments_preserves_results() {
+        let venue = Venue::from("OPRA");
+        let mut records = Vec::new();
+
+        for retire in [false, true] {
+            let (mut engine, registered) = rolling_option_book_engine(venue, retire);
+            let mut runs = Vec::new();
+
+            // The second run after reset replays over every retired engine restored
+            for run in 0..2 {
+                if run > 0 {
+                    engine.reset().unwrap();
+                }
+                engine.run(None, None, None, false).unwrap();
+
+                let rejected = engine
+                    .kernel
+                    .cache
+                    .borrow()
+                    .orders(None, None, None, None, None)
+                    .iter()
+                    .filter(|order| order.status() == OrderStatus::Rejected)
+                    .count();
+                assert_eq!(rejected, 2, "late orders reach the expired contracts");
+
+                let exchange = engine.venues[&venue].borrow();
+                let retired = exchange.retired_instrument_count();
+                assert_eq!(exchange.get_matching_engines().len() + retired, registered);
+                assert_eq!(retired > 0, retire);
+                drop(exchange);
+
+                runs.push(trading_record(&engine, venue));
+            }
+            engine.dispose();
+            records.push(runs);
+        }
+
+        assert_eq!(records[1], records[0]);
     }
 
     fn replay_binary_option(expiration_ns: u64, price_increment: &str) -> BinaryOption {

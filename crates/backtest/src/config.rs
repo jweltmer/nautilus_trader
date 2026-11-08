@@ -358,6 +358,10 @@ pub struct SimulatedVenueConfig {
     /// If open orders are canceled before liquidating positions.
     #[builder(default = true)]
     pub liquidation_cancel_open_orders: bool,
+    /// If instruments are retired from the exchange once their expiration has been processed
+    /// and nothing remains open for them.
+    #[builder(default = false)]
+    pub retire_expired_instruments: bool,
     /// The queue-priority reset policy for successful modify commands.
     #[builder(default)]
     pub order_priority_reset_policy: OrderPriorityResetPolicy,
@@ -544,6 +548,10 @@ pub struct BacktestVenueConfig {
     /// If open orders should be canceled before closing positions during liquidation.
     #[builder(default = true)]
     liquidation_cancel_open_orders: bool,
+    /// If instruments should be retired from the exchange once their expiration has been
+    /// processed and nothing remains open for them.
+    #[builder(default)]
+    retire_expired_instruments: bool,
     #[builder(default)]
     order_priority_reset_policy: OrderPriorityResetPolicy,
 }
@@ -816,6 +824,11 @@ impl BacktestVenueConfig {
         self.liquidation_cancel_open_orders
     }
 
+    #[must_use]
+    pub fn retire_expired_instruments(&self) -> bool {
+        self.retire_expired_instruments
+    }
+
     #[cfg(feature = "streaming")]
     pub(crate) fn to_simulated(&self) -> anyhow::Result<SimulatedVenueConfig> {
         let starting_balances: Vec<Money> = self
@@ -908,6 +921,7 @@ fn build_simulated_venue(
         .liquidation_enabled(config.liquidation_enabled())
         .liquidation_trigger_ratio(config.liquidation_trigger_ratio())
         .liquidation_cancel_open_orders(config.liquidation_cancel_open_orders())
+        .retire_expired_instruments(config.retire_expired_instruments())
         .build()
 }
 
@@ -1451,6 +1465,7 @@ mod tests {
             .liquidation_enabled(true)
             .liquidation_trigger_ratio(1.5)
             .liquidation_cancel_open_orders(false)
+            .retire_expired_instruments(true)
             .order_priority_reset_policy(OrderPriorityResetPolicy::AnyModify)
             .build()
             .unwrap();
@@ -1503,6 +1518,7 @@ mod tests {
             1.5_f64.to_bits()
         );
         assert!(!runtime.liquidation_cancel_open_orders);
+        assert!(runtime.retire_expired_instruments);
         assert_eq!(
             runtime.order_priority_reset_policy,
             OrderPriorityResetPolicy::AnyModify
