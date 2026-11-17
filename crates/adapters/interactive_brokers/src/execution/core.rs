@@ -116,6 +116,7 @@ pub(super) use super::{
 use super::{
     incarnations::OrderIncarnationGroup,
     parse::{FillEvidence, parse_order_data_to_report},
+    reports::OrderStatusCollection,
 };
 pub(super) use crate::{
     common::shared_client::{SharedClientHandle, get_or_connect},
@@ -1502,8 +1503,8 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let report_client = self.report_client()?;
-        let (order_reports, fill_evidence, position_reports) = tokio::try_join!(
-            self.generate_order_status_reports(&order_cmd),
+        let (order_collection, fill_evidence, position_reports) = tokio::try_join!(
+            report_client.collect_order_status_reports(&order_cmd),
             report_client.generate_fill_evidence(fill_cmd),
             self.generate_position_status_reports(&position_cmd),
         )?;
@@ -1511,7 +1512,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         Ok(Some(self.assemble_mass_status(
             ts_now,
             start,
-            order_reports,
+            order_collection,
             fill_evidence,
             position_reports,
         )))
@@ -2278,10 +2279,11 @@ impl InteractiveBrokersExecutionClient {
         &self,
         ts_now: UnixNanos,
         start: Option<UnixNanos>,
-        mut order_reports: Vec<OrderStatusReport>,
+        order_collection: OrderStatusCollection,
         mut fill_evidence: FillEvidence,
         mut position_reports: Vec<PositionStatusReport>,
     ) -> ExecutionMassStatus {
+        let mut order_reports = order_collection.reports;
         let deferred_orders: AHashSet<VenueOrderId> = fill_evidence
             .missing_commissions
             .iter()
@@ -2342,10 +2344,13 @@ impl InteractiveBrokersExecutionClient {
         );
         // IB `reqExecutions` and completed orders are session-scoped, so without a
         // configured lookback the actual venue bound is unknown and the report set
-        // cannot be claimed complete. Nor can it when an instrument was deferred.
+        // cannot be claimed complete. Nor can it when an instrument was deferred, or a
+        // completed order was left out because its contract did not resolve.
         mass_status.set_report_window(
             start,
-            start.is_some() && fill_evidence.missing_commissions.is_empty(),
+            start.is_some()
+                && fill_evidence.missing_commissions.is_empty()
+                && order_collection.unresolved.is_empty(),
         );
 
         parse::fill_missing_avg_px(&mut order_reports, &fill_evidence.reports);
