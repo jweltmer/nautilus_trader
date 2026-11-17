@@ -1499,11 +1499,13 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let report_client = self.report_client()?;
-        let (mut order_reports, fill_evidence, mut position_reports) = tokio::try_join!(
-            self.generate_order_status_reports(&order_cmd),
+        let (order_collection, fill_evidence, mut position_reports) = tokio::try_join!(
+            report_client.collect_order_status_reports(&order_cmd),
             report_client.generate_fill_evidence(fill_cmd),
             self.generate_position_status_reports(&position_cmd),
         )?;
+
+        let mut order_reports = order_collection.reports;
 
         tracing::info!(
             "generate_mass_status: {} order reports, {} fill reports, {} position reports",
@@ -1521,8 +1523,12 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         );
         // IB `reqExecutions` and completed orders are session-scoped, so without a
         // configured lookback the actual venue bound is unknown and the report set
-        // cannot be claimed complete.
-        mass_status.set_report_window(start, start.is_some());
+        // cannot be claimed complete. Nor can it when a completed order was left out
+        // because its contract did not resolve.
+        mass_status.set_report_window(
+            start,
+            start.is_some() && order_collection.unresolved.is_empty(),
+        );
 
         parse::fill_missing_avg_px(&mut order_reports, &fill_evidence.reports);
         parse::fill_position_avg_px_from_fills(
