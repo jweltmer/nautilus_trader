@@ -75,11 +75,6 @@ pub(crate) fn ib_account_code(configured: Option<&str>, account_id: AccountId) -
 // Rows of one IB refresh batch arrive within milliseconds of each other.
 const ACCOUNT_SUMMARY_QUIET: Duration = Duration::from_secs(1);
 
-// IB sends the changed summary values every three minutes. After its nightly reset a
-// subscription can stay open and send nothing, so one silent for two periods is re-requested;
-// the new subscription answers with a full snapshot, so a quiet account loses nothing.
-const ACCOUNT_SUMMARY_SILENCE: Duration = Duration::from_secs(360);
-
 pub type AccountSnapshot = (Vec<AccountBalance>, Vec<MarginBalance>, Option<Params>);
 
 type AccountSummaryStream = FilterDataStream<Subscription<AccountSummaryResult>>;
@@ -158,7 +153,6 @@ where
             ib_account,
             cancel,
             RebindDelays::from_consts(),
-            ACCOUNT_SUMMARY_SILENCE,
         )
         .await;
     };
@@ -170,8 +164,8 @@ where
     Ok(())
 }
 
-/// Delivers a snapshot per refresh cycle and reopens the subscription when it ends or sends
-/// nothing for `silence`, until `cancel` fires.
+/// Delivers a snapshot per refresh cycle and reopens the subscription when it ends, until
+/// `cancel` fires.
 ///
 /// IB ends the subscription when the transport drops and ibapi does not resubscribe it, so
 /// failed opens are retried while ibapi reconnects.
@@ -184,7 +178,6 @@ async fn run_account_summary_stream<S, O, F, T>(
     ib_account: Ustr,
     cancel: CancellationToken,
     delays: RebindDelays,
-    silence: Duration,
 ) where
     S: Stream<Item = Result<AccountSummaryResult, ibapi::Error>> + Unpin,
     O: FnMut() -> F,
@@ -194,21 +187,19 @@ async fn run_account_summary_stream<S, O, F, T>(
     let mut quiet = Some(ACCOUNT_SUMMARY_QUIET);
 
     loop {
-        let silent = loop {
+        loop {
             let refreshed = tokio::select! {
                 () = cancel.cancelled() => return,
-                refreshed = tokio::time::timeout(silence, read_account_summary_cycle(
+                refreshed = read_account_summary_cycle(
                     &mut subscription,
                     ib_account,
                     &mut accumulator,
                     quiet,
-                )) => refreshed,
+                ) => refreshed,
             };
 
-            match refreshed {
-                Ok(true) => {}
-                Ok(false) => break false,
-                Err(_) => break true,
+            if !refreshed {
+                break;
             }
 
             quiet = Some(ACCOUNT_SUMMARY_QUIET);
@@ -222,22 +213,13 @@ async fn run_account_summary_stream<S, O, F, T>(
                 Ok(snapshot) => on_snapshot(snapshot),
                 Err(e) => tracing::warn!("Failed to build account snapshot: {}", e),
             }
-        };
-
-        if silent {
-            tracing::warn!(
-                "IB account summary stream silent for {:?} for account: {}; re-requesting in {:?}",
-                silence,
-                ib_account,
-                delays.after_stream
-            );
-        } else {
-            tracing::warn!(
-                "IB account summary stream ended for account: {}; reopening in {:?}",
-                ib_account,
-                delays.after_stream
-            );
         }
+
+        tracing::warn!(
+            "IB account summary stream ended for account: {}; reopening in {:?}",
+            ib_account,
+            delays.after_stream
+        );
         drop(subscription);
 
         if !sleep_or_cancel(delays.after_stream, &cancel).await {
@@ -972,11 +954,11 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        ACCOUNT_SUMMARY_QUIET, ACCOUNT_SUMMARY_SILENCE, AccountSummaryAccumulator,
-        AccountSummaryTags, check_external_position_change, create_position_tracker,
-        finalize_account_summary_balances, ib_account_code, merge_account_summary_balance,
-        merge_account_summary_margin, merge_account_value, parse_currency,
-        read_account_summary_cycle, record_own_fill, run_account_summary_stream,
+        ACCOUNT_SUMMARY_QUIET, AccountSummaryAccumulator, AccountSummaryTags,
+        check_external_position_change, create_position_tracker, finalize_account_summary_balances,
+        ib_account_code, merge_account_summary_balance, merge_account_summary_margin,
+        merge_account_value, parse_currency, read_account_summary_cycle, record_own_fill,
+        run_account_summary_stream,
     };
     use crate::execution::updates::RebindDelays;
 
@@ -1431,7 +1413,6 @@ mod tests {
             ustr::Ustr::from("DU123"),
             cancel.clone(),
             TEST_DELAYS,
-            ACCOUNT_SUMMARY_SILENCE,
         )
         .await;
 
@@ -1501,7 +1482,6 @@ mod tests {
             ustr::Ustr::from("DU123"),
             cancel.clone(),
             TEST_DELAYS,
-            ACCOUNT_SUMMARY_SILENCE,
         )
         .await;
 
@@ -1578,63 +1558,12 @@ mod tests {
             ustr::Ustr::from("DU123"),
             cancel.clone(),
             TEST_DELAYS,
-            ACCOUNT_SUMMARY_SILENCE,
         )
         .await;
 
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0].len(), 2);
         assert_eq!(seen[1], vec!["USD".to_string()]);
-    }
-
-    // After IB's nightly reset a subscription can stay open and send nothing; it is re-requested
-    // once silent for the bound, and the new subscription's snapshot is delivered
-    #[rstest]
-    #[tokio::test(start_paused = true)]
-    async fn test_run_account_summary_stream_rerequests_after_silence() {
-        let mut opens = std::collections::VecDeque::from([
-            Ok(open_stream("1050.75")),
-            Ok(open_stream("1100.25")),
-        ]);
-        let mut open_calls = 0;
-        let open = || {
-            open_calls += 1;
-            let next = opens.pop_front().expect("unexpected open");
-            async move { next }
-        };
-        let cancel = CancellationToken::new();
-        let started = tokio::time::Instant::now();
-        let mut seen = Vec::new();
-        let on_snapshot = |value| {
-            seen.push((started.elapsed(), value));
-            if seen.len() == 3 {
-                cancel.cancel();
-            }
-        };
-
-        run_account_summary_stream(
-            open_stream("1000.50"),
-            open,
-            async |accumulator: &AccountSummaryAccumulator| Ok(net_liquidation(accumulator)),
-            on_snapshot,
-            AccountSummaryAccumulator::default(),
-            ustr::Ustr::from("DU123"),
-            cancel.clone(),
-            TEST_DELAYS,
-            ACCOUNT_SUMMARY_SILENCE,
-        )
-        .await;
-
-        let cycle = ACCOUNT_SUMMARY_SILENCE + TEST_DELAYS.after_stream;
-        assert_eq!(
-            seen,
-            vec![
-                (Duration::ZERO, Decimal::new(100050, 2)),
-                (cycle, Decimal::new(105075, 2)),
-                (cycle * 2, Decimal::new(110025, 2)),
-            ]
-        );
-        assert_eq!(open_calls, 2);
     }
 
     #[rstest]
@@ -1658,7 +1587,6 @@ mod tests {
                 ustr::Ustr::from("DU123"),
                 cancel,
                 TEST_DELAYS,
-                ACCOUNT_SUMMARY_SILENCE,
             ),
             async move {
                 tokio::time::sleep(Duration::from_millis(55)).await;
