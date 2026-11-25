@@ -47,7 +47,6 @@ use nautilus_model::{
     types::{AccountBalance, Currency, MarginBalance, Money, Quantity},
 };
 use rust_decimal::{Decimal, prelude::ToPrimitive};
-use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
@@ -129,7 +128,7 @@ pub async fn subscribe_account_summary(
 /// IB repeats the summary about every 3 minutes on a live `reqAccountSummary` subscription. A
 /// session task delivers one further snapshot per refresh cycle through `on_snapshot`, reopens
 /// the subscription when it ends, and re-requests it whenever `rerequest` changes (see
-/// [`notice_requests_account_summary`]).
+/// `notice_requests_account_summary`).
 ///
 /// # Errors
 ///
@@ -139,7 +138,7 @@ pub async fn stream_account_summary<F>(
     ib_account: Ustr,
     request_timeout: Duration,
     session_tasks: &TaskGroup,
-    rerequest: watch::Receiver<()>,
+    rerequest: tokio::sync::watch::Receiver<()>,
     on_snapshot: F,
 ) -> anyhow::Result<()>
 where
@@ -201,7 +200,7 @@ async fn run_account_summary_stream<S, O, F, T>(
     mut accumulator: AccountSummaryAccumulator,
     ib_account: Ustr,
     cancel: CancellationToken,
-    mut rerequest: watch::Receiver<()>,
+    mut rerequest: tokio::sync::watch::Receiver<()>,
     delays: RebindDelays,
 ) where
     S: Stream<Item = Result<AccountSummaryResult, ibapi::Error>> + Unpin,
@@ -996,7 +995,6 @@ mod tests {
     };
     use rstest::rstest;
     use rust_decimal::Decimal;
-    use tokio::sync::watch;
     use tokio_util::sync::CancellationToken;
 
     use super::{
@@ -1428,8 +1426,8 @@ mod tests {
             .as_decimal()
     }
 
-    fn closed_rerequest() -> watch::Receiver<()> {
-        watch::channel(()).1
+    fn closed_rerequest() -> tokio::sync::watch::Receiver<()> {
+        tokio::sync::watch::channel(()).1
     }
 
     fn notice(code: i32) -> Notice {
@@ -1467,7 +1465,7 @@ mod tests {
             let next = reopened.take().expect("unexpected open");
             async move { Ok(next) }
         };
-        let (rerequest, receiver) = watch::channel(());
+        let (rerequest, receiver) = tokio::sync::watch::channel(());
         let cancel = CancellationToken::new();
         let started = tokio::time::Instant::now();
         let mut seen = Vec::new();
@@ -1523,7 +1521,7 @@ mod tests {
             let next = reopened.take().expect("unexpected open");
             async move { Ok(next) }
         };
-        let (rerequest, receiver) = watch::channel(());
+        let (rerequest, receiver) = tokio::sync::watch::channel(());
         let cancel = CancellationToken::new();
         let canceller = cancel.clone();
         let mut seen = Vec::new();
