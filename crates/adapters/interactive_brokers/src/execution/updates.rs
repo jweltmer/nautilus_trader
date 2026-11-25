@@ -13,7 +13,9 @@ use std::future::Future;
 
 use nautilus_common::live::sender::EventSender;
 
-use super::{core::*, incarnations::duplicate_client_order_id};
+use super::{
+    account::notice_requests_account_summary, core::*, incarnations::duplicate_client_order_id,
+};
 use crate::{
     common::{
         consts::{ORDER_UPDATE_BIND_RETRY_DELAY_SECS, ORDER_UPDATE_REBIND_DELAY_SECS},
@@ -287,6 +289,7 @@ impl InteractiveBrokersExecutionClient {
         let account_id = self.core.account_id;
         let orders = self.orders.clone();
         let is_connected = Arc::clone(&self.is_connected);
+        let account_summary_rerequest = self.account_summary_rerequest.clone();
         let tasks = self
             .session_tasks
             .spawner()
@@ -312,6 +315,10 @@ impl InteractiveBrokersExecutionClient {
                             is_connected.store(false, Ordering::Relaxed);
                             return;
                         };
+
+                        if notice_requests_account_summary(&notice) {
+                            account_summary_rerequest.send_replace(());
+                        }
 
                         if let Err(e) = Self::handle_order_notice(
                             &notice,

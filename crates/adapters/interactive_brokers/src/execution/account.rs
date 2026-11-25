@@ -20,6 +20,7 @@ use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 use anyhow::Context;
 use futures_util::Stream;
 use ibapi::{
+    NOTICE_STREAM_LAG_CODE, Notice,
     accounts::{
         AccountSummary, AccountSummaryResult, AccountSummaryTags, AccountUpdate, AccountValue,
         types::{AccountGroup, AccountId as IbAccountId},
@@ -46,6 +47,7 @@ use nautilus_model::{
     types::{AccountBalance, Currency, MarginBalance, Money, Quantity},
 };
 use rust_decimal::{Decimal, prelude::ToPrimitive};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
@@ -74,6 +76,24 @@ pub(crate) fn ib_account_code(configured: Option<&str>, account_id: AccountId) -
 
 // Rows of one IB refresh batch arrive within milliseconds of each other.
 const ACCOUNT_SUMMARY_QUIET: Duration = Duration::from_secs(1);
+
+const CONNECTIVITY_RESTORED_DATA_LOST_CODE: i32 = 1101;
+const CONNECTIVITY_RESTORED_DATA_MAINTAINED_CODE: i32 = 1102;
+
+/// Returns whether `notice` calls for re-requesting the account summary subscription.
+///
+/// After IB restores its connection to the IB servers (1101, or 1102 with data maintained) an
+/// open account summary subscription can deliver one update and then stay silent without
+/// ending, so no stream end triggers a reopen. A notice stream lag may have dropped such a
+/// notice, so it is treated the same way.
+pub(super) fn notice_requests_account_summary(notice: &Notice) -> bool {
+    matches!(
+        notice.code,
+        CONNECTIVITY_RESTORED_DATA_LOST_CODE
+            | CONNECTIVITY_RESTORED_DATA_MAINTAINED_CODE
+            | NOTICE_STREAM_LAG_CODE
+    )
+}
 
 pub type AccountSnapshot = (Vec<AccountBalance>, Vec<MarginBalance>, Option<Params>);
 
@@ -107,8 +127,9 @@ pub async fn subscribe_account_summary(
 /// Subscribe to account summary, deliver the first snapshot, and keep the subscription open.
 ///
 /// IB repeats the summary about every 3 minutes on a live `reqAccountSummary` subscription. A
-/// session task delivers one further snapshot per refresh cycle through `on_snapshot`, and
-/// reopens the subscription when it ends.
+/// session task delivers one further snapshot per refresh cycle through `on_snapshot`, reopens
+/// the subscription when it ends, and re-requests it whenever `rerequest` changes (see
+/// [`notice_requests_account_summary`]).
 ///
 /// # Errors
 ///
@@ -118,6 +139,7 @@ pub async fn stream_account_summary<F>(
     ib_account: Ustr,
     request_timeout: Duration,
     session_tasks: &TaskGroup,
+    rerequest: watch::Receiver<()>,
     on_snapshot: F,
 ) -> anyhow::Result<()>
 where
@@ -152,6 +174,7 @@ where
             accumulator,
             ib_account,
             cancel,
+            rerequest,
             RebindDelays::from_consts(),
         )
         .await;
@@ -164,11 +187,12 @@ where
     Ok(())
 }
 
-/// Delivers a snapshot per refresh cycle and reopens the subscription when it ends, until
-/// `cancel` fires.
+/// Delivers a snapshot per refresh cycle, reopens the subscription when it ends, and
+/// re-requests it when `rerequest` changes, until `cancel` fires.
 ///
 /// IB ends the subscription when the transport drops and ibapi does not resubscribe it, so
 /// failed opens are retried while ibapi reconnects.
+#[allow(clippy::too_many_arguments)] // The stream task owns explicit shared client state.
 async fn run_account_summary_stream<S, O, F, T>(
     initial: S,
     mut open: O,
@@ -177,6 +201,7 @@ async fn run_account_summary_stream<S, O, F, T>(
     mut accumulator: AccountSummaryAccumulator,
     ib_account: Ustr,
     cancel: CancellationToken,
+    mut rerequest: watch::Receiver<()>,
     delays: RebindDelays,
 ) where
     S: Stream<Item = Result<AccountSummaryResult, ibapi::Error>> + Unpin,
@@ -185,11 +210,19 @@ async fn run_account_summary_stream<S, O, F, T>(
 {
     let mut subscription = initial;
     let mut quiet = Some(ACCOUNT_SUMMARY_QUIET);
+    let mut rerequest_open = true;
 
     loop {
-        loop {
+        let rerequested = loop {
             let refreshed = tokio::select! {
                 () = cancel.cancelled() => return,
+                changed = rerequest.changed(), if rerequest_open => {
+                    if changed.is_ok() {
+                        break true;
+                    }
+                    rerequest_open = false;
+                    continue;
+                }
                 refreshed = read_account_summary_cycle(
                     &mut subscription,
                     ib_account,
@@ -199,7 +232,7 @@ async fn run_account_summary_stream<S, O, F, T>(
             };
 
             if !refreshed {
-                break;
+                break false;
             }
 
             quiet = Some(ACCOUNT_SUMMARY_QUIET);
@@ -213,18 +246,29 @@ async fn run_account_summary_stream<S, O, F, T>(
                 Ok(snapshot) => on_snapshot(snapshot),
                 Err(e) => tracing::warn!("Failed to build account snapshot: {}", e),
             }
-        }
+        };
 
-        tracing::warn!(
-            "IB account summary stream ended for account: {}; reopening in {:?}",
-            ib_account,
-            delays.after_stream
-        );
+        if rerequested {
+            tracing::info!(
+                "IB connectivity restored; re-requesting account summary for account: {} in {:?}",
+                ib_account,
+                delays.after_stream
+            );
+        } else {
+            tracing::warn!(
+                "IB account summary stream ended for account: {}; reopening in {:?}",
+                ib_account,
+                delays.after_stream
+            );
+        }
         drop(subscription);
 
         if !sleep_or_cancel(delays.after_stream, &cancel).await {
             return;
         }
+
+        // The subscription opened next postdates every notice seen so far
+        rerequest.borrow_and_update();
 
         subscription = loop {
             let opened = tokio::select! {
@@ -940,6 +984,7 @@ mod tests {
 
     use futures_util::{StreamExt, stream, stream::BoxStream};
     use ibapi::{
+        Notice,
         accounts::{AccountSummary, AccountSummaryResult, AccountValue},
         orders::ExecutionSide,
     };
@@ -951,14 +996,15 @@ mod tests {
     };
     use rstest::rstest;
     use rust_decimal::Decimal;
+    use tokio::sync::watch;
     use tokio_util::sync::CancellationToken;
 
     use super::{
         ACCOUNT_SUMMARY_QUIET, AccountSummaryAccumulator, AccountSummaryTags,
         check_external_position_change, create_position_tracker, finalize_account_summary_balances,
         ib_account_code, merge_account_summary_balance, merge_account_summary_margin,
-        merge_account_value, parse_currency, read_account_summary_cycle, record_own_fill,
-        run_account_summary_stream,
+        merge_account_value, notice_requests_account_summary, parse_currency,
+        read_account_summary_cycle, record_own_fill, run_account_summary_stream,
     };
     use crate::execution::updates::RebindDelays;
 
@@ -1382,6 +1428,136 @@ mod tests {
             .as_decimal()
     }
 
+    fn closed_rerequest() -> watch::Receiver<()> {
+        watch::channel(()).1
+    }
+
+    fn notice(code: i32) -> Notice {
+        Notice {
+            request_id: None,
+            code,
+            message: String::new(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        }
+    }
+
+    #[rstest]
+    #[case(1101, true)]
+    #[case(1102, true)]
+    #[case(ibapi::NOTICE_STREAM_LAG_CODE, true)]
+    #[case(1100, false)]
+    #[case(1300, false)]
+    #[case(2104, false)]
+    #[case(2105, false)]
+    #[case(ibapi::TRANSPORT_RECONNECT_CODE, false)]
+    fn test_notice_requests_account_summary(#[case] code: i32, #[case] expected: bool) {
+        assert_eq!(notice_requests_account_summary(&notice(code)), expected);
+    }
+
+    // After IB restores its server connection an open subscription can go silent without
+    // ending; the restoration notice re-requests it and the new snapshot is delivered
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_run_account_summary_stream_rerequests_on_signal() {
+        let mut reopened = Some(open_stream("1100.25"));
+        let mut open_calls = 0;
+        let open = || {
+            open_calls += 1;
+            let next = reopened.take().expect("unexpected open");
+            async move { Ok(next) }
+        };
+        let (rerequest, receiver) = watch::channel(());
+        let cancel = CancellationToken::new();
+        let started = tokio::time::Instant::now();
+        let mut seen = Vec::new();
+        let on_snapshot = |value| {
+            seen.push((started.elapsed(), value));
+            if seen.len() == 2 {
+                cancel.cancel();
+            }
+        };
+
+        tokio::join!(
+            run_account_summary_stream(
+                open_stream("1000.50"),
+                open,
+                async |accumulator: &AccountSummaryAccumulator| Ok(net_liquidation(accumulator)),
+                on_snapshot,
+                AccountSummaryAccumulator::default(),
+                ustr::Ustr::from("DU123"),
+                cancel.clone(),
+                receiver,
+                TEST_DELAYS,
+            ),
+            async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                rerequest.send_replace(());
+                // Keep the sender alive until the loop has seen it
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            },
+        );
+
+        assert_eq!(
+            seen,
+            vec![
+                (Duration::ZERO, Decimal::new(100_050, 2)),
+                (
+                    Duration::from_secs(30) + TEST_DELAYS.after_stream,
+                    Decimal::new(110_025, 2),
+                ),
+            ]
+        );
+        assert_eq!(open_calls, 1);
+    }
+
+    // A burst of notices (1100/1102 pairs, or one arriving while the re-request waits) opens
+    // one new subscription, not one per notice
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_run_account_summary_stream_coalesces_notices_into_one_rerequest() {
+        let mut reopened = Some(open_stream("1100.25"));
+        let mut open_calls = 0;
+        let open = || {
+            open_calls += 1;
+            let next = reopened.take().expect("unexpected open");
+            async move { Ok(next) }
+        };
+        let (rerequest, receiver) = watch::channel(());
+        let cancel = CancellationToken::new();
+        let canceller = cancel.clone();
+        let mut seen = Vec::new();
+
+        tokio::join!(
+            run_account_summary_stream(
+                open_stream("1000.50"),
+                open,
+                async |accumulator: &AccountSummaryAccumulator| Ok(net_liquidation(accumulator)),
+                |value| seen.push(value),
+                AccountSummaryAccumulator::default(),
+                ustr::Ustr::from("DU123"),
+                cancel,
+                receiver,
+                TEST_DELAYS,
+            ),
+            async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                rerequest.send_replace(());
+                rerequest.send_replace(());
+                tokio::time::sleep(TEST_DELAYS.after_stream / 2).await;
+                rerequest.send_replace(());
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                canceller.cancel();
+            },
+        );
+
+        assert_eq!(
+            seen,
+            vec![Decimal::new(100_050, 2), Decimal::new(110_025, 2)]
+        );
+        assert_eq!(open_calls, 1);
+    }
+
     #[rstest]
     #[tokio::test(start_paused = true)]
     async fn test_run_account_summary_stream_reopens_after_end_and_failed_open() {
@@ -1412,6 +1588,7 @@ mod tests {
             AccountSummaryAccumulator::default(),
             ustr::Ustr::from("DU123"),
             cancel.clone(),
+            closed_rerequest(),
             TEST_DELAYS,
         )
         .await;
@@ -1481,6 +1658,7 @@ mod tests {
             AccountSummaryAccumulator::default(),
             ustr::Ustr::from("DU123"),
             cancel.clone(),
+            closed_rerequest(),
             TEST_DELAYS,
         )
         .await;
@@ -1557,6 +1735,7 @@ mod tests {
             AccountSummaryAccumulator::default(),
             ustr::Ustr::from("DU123"),
             cancel.clone(),
+            closed_rerequest(),
             TEST_DELAYS,
         )
         .await;
@@ -1586,6 +1765,7 @@ mod tests {
                 AccountSummaryAccumulator::default(),
                 ustr::Ustr::from("DU123"),
                 cancel,
+                closed_rerequest(),
                 TEST_DELAYS,
             ),
             async move {
