@@ -7147,15 +7147,16 @@ fn test_startup_leaves_out_order_with_execution_missing_commission() {
     assert!(stop.is_open());
     assert_eq!(stop.filled_qty(), Quantity::from(0));
 
-    // Reconciliation restores the reported four at IB's average cost (7881.875, at the price
-    // precision), so the missing execution's price is not taken from the affected order's
-    // commissioned fill (7880.75)
+    // Reconciliation restores the reported four. IB's average cost nets commissions in, so it is
+    // marked opening-only and not matched: the two missing contracts are recovered at it
+    // (7881.88) beside the complete order's two fills at 7882.50. The missing execution's price
+    // is not taken from the affected order's commissioned fill (7880.75)
     let positions = cache.positions_open(None, Some(&mes.id()), None, None, None);
     assert_eq!(positions.len(), 1);
     assert_eq!(positions[0].signed_qty, Decimal::from(4));
     assert_eq!(
         positions[0].avg_px_open,
-        Decimal::from_str("7881.88").unwrap()
+        Decimal::from_str("7882.19").unwrap()
     );
     assert!(unresolved.is_empty(), "{unresolved:?}");
 }
