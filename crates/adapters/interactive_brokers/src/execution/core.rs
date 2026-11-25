@@ -169,6 +169,8 @@ pub struct InteractiveBrokersExecutionClient {
     pub(super) pending_execution_cache: Arc<Mutex<PendingExecutionCache>>,
     /// Position tracker for detecting external position changes (e.g., option exercises).
     pub(super) position_tracker: PositionTracker,
+    /// Signals the account summary task to re-request its subscription.
+    pub(super) account_summary_rerequest: tokio::sync::watch::Sender<()>,
 }
 
 pub(super) type CommissionCache = FifoCacheMap<String, (f64, String), 10_000>;
@@ -475,6 +477,7 @@ impl InteractiveBrokersExecutionClient {
             commission_cache: Arc::new(Mutex::new(CommissionCache::new())),
             pending_execution_cache: Arc::new(Mutex::new(PendingExecutionCache::new())),
             position_tracker: create_position_tracker(),
+            account_summary_rerequest: tokio::sync::watch::Sender::new(()),
         })
     }
 
@@ -1260,6 +1263,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             self.ib_account,
             Duration::from_secs(self.config.request_timeout),
             &self.session_tasks,
+            self.account_summary_rerequest.subscribe(),
             send_account_state,
         )
         .await
