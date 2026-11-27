@@ -21,9 +21,14 @@ use nautilus_core::correctness::{CorrectnessResultExt, FAILED};
 
 use super::config::check_cache_data_capacity;
 
+/// The fewest slots a growing [`BoundedVecDeque`] allocates.
+const MIN_ALLOCATION: usize = 8;
+
 /// A bounded deque that maintains at most `capacity` elements.
 ///
-/// Uses a `VecDeque` internally with runtime-configured capacity.
+/// Uses a `VecDeque` internally with runtime-configured capacity. Storage is allocated as elements
+/// arrive, doubling up to `capacity`, so a cache holding history for many instruments uses memory
+/// in proportion to what it holds rather than `capacity` per instrument.
 /// When capacity is exceeded on `push_front`, the oldest entry (back) is automatically evicted.
 #[derive(Debug, Clone)]
 pub(super) struct BoundedVecDeque<T> {
@@ -42,8 +47,19 @@ impl<T> BoundedVecDeque<T> {
         check_cache_data_capacity(capacity, stringify!(capacity)).expect_display(FAILED);
 
         Self {
-            inner: VecDeque::with_capacity(capacity),
+            inner: VecDeque::new(),
             capacity,
+        }
+    }
+
+    // Makes room for one more element below `capacity`. `VecDeque` alone would double past
+    // `capacity`, so growth is reserved here and capped, and a full deque holds `capacity` slots
+    fn reserve_one(&mut self) {
+        let len = self.inner.len();
+
+        if len == self.inner.capacity() && len < self.capacity {
+            let target = len.saturating_mul(2).max(MIN_ALLOCATION).min(self.capacity);
+            self.inner.reserve_exact(target - len);
         }
     }
 
@@ -51,6 +67,8 @@ impl<T> BoundedVecDeque<T> {
     pub(super) fn push_front(&mut self, item: T) {
         if self.inner.len() >= self.capacity {
             self.inner.pop_back();
+        } else {
+            self.reserve_one();
         }
         self.inner.push_front(item);
     }
@@ -90,10 +108,20 @@ impl<T> BoundedVecDeque<T> {
     ///
     /// Panics if `index` is greater than the number of elements.
     pub(super) fn insert(&mut self, index: usize, item: T) {
-        self.inner.insert(index, item);
-        if self.inner.len() > self.capacity {
+        let len = self.inner.len();
+
+        if len < self.capacity {
+            self.reserve_one();
+        } else if index < len {
+            // Evicts before inserting, so the deque never holds `capacity + 1` elements and
+            // never reallocates beyond `capacity`
             self.inner.pop_back();
+        } else {
+            assert!(index == len, "index out of bounds");
+            // The item would be the oldest, which a full deque evicts
+            return;
         }
+        self.inner.insert(index, item);
     }
 
     /// Returns the number of elements.
@@ -150,10 +178,56 @@ mod tests {
     }
 
     #[rstest]
-    fn test_new_accepts_maximum_capacity() {
+    fn test_new_accepts_maximum_capacity_without_allocating() {
         let deque: BoundedVecDeque<i32> = BoundedVecDeque::new(MAX_CACHE_DATA_CAPACITY);
 
-        assert!(deque.inner.capacity() >= MAX_CACHE_DATA_CAPACITY);
+        assert_eq!(deque.inner.capacity(), 0);
+    }
+
+    // Storage follows the elements held and stops at `capacity`, where `VecDeque` would double
+    #[rstest]
+    #[case(1)]
+    #[case(3)]
+    #[case(8)]
+    #[case(100)]
+    #[case(10_000)]
+    fn test_allocation_grows_with_elements_up_to_capacity(#[case] capacity: usize) {
+        let mut deque = BoundedVecDeque::new(capacity);
+        deque.push_front(0);
+        assert!(deque.inner.capacity() <= capacity.min(MIN_ALLOCATION));
+
+        for i in 1..capacity * 2 {
+            deque.push_front(i);
+            assert!(deque.inner.capacity() >= deque.len());
+            assert!(deque.inner.capacity() <= capacity);
+        }
+
+        assert_eq!(deque.len(), capacity);
+        assert_eq!(deque.inner.capacity(), capacity);
+    }
+
+    #[rstest]
+    fn test_insert_at_capacity_does_not_reallocate() {
+        let mut deque = BoundedVecDeque::new(100);
+        for i in 0..100 {
+            deque.push_front(i * 10);
+        }
+
+        deque.insert(50, 5);
+        deque.insert(100, 1);
+
+        assert_eq!(deque.len(), 100);
+        assert_eq!(deque.inner.capacity(), 100);
+    }
+
+    #[rstest]
+    #[should_panic(expected = "index out of bounds")]
+    fn test_insert_beyond_len_panics_at_capacity() {
+        let mut deque = BoundedVecDeque::new(2);
+        deque.push_front(1);
+        deque.push_front(2);
+
+        deque.insert(3, 0);
     }
 
     #[rstest]
