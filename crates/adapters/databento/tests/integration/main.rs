@@ -15,7 +15,6 @@
 
 mod mbo_promotion;
 mod python;
-mod settlement;
 
 #[cfg(feature = "live")]
 mod batches;
