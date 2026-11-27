@@ -43,6 +43,7 @@ use crate::{
 /// Represents a generic option contract instrument.
 #[repr(C)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(try_from = "OptionContractRepr")]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
@@ -120,6 +121,105 @@ pub struct OptionContract {
     pub ts_event: UnixNanos,
     /// UNIX timestamp (nanoseconds) when the data object was initialized.
     pub ts_init: UnixNanos,
+}
+
+/// Deserialization form of [`OptionContract`].
+///
+/// Records written before the strike, quote and settlement currencies were split carry a single
+/// `currency`, which applied to all three; such a record restores with that currency in each.
+#[derive(Deserialize)]
+struct OptionContractRepr {
+    id: InstrumentId,
+    raw_symbol: Symbol,
+    asset_class: AssetClass,
+    exchange: Option<Ustr>,
+    underlying: Ustr,
+    #[serde(default)]
+    underlying_instrument_id: Option<InstrumentId>,
+    option_kind: OptionKind,
+    strike_price: Price,
+    #[serde(default)]
+    strike_currency: Option<Currency>,
+    #[serde(default)]
+    quote_currency: Option<Currency>,
+    #[serde(default)]
+    settlement_currency: Option<Currency>,
+    #[serde(default)]
+    currency: Option<Currency>,
+    #[serde(default)]
+    premium_style: Option<OptionPremiumStyle>,
+    #[serde(default)]
+    exercise_style: Option<ExerciseStyle>,
+    #[serde(default)]
+    settlement_type: Option<SettlementType>,
+    activation_ns: UnixNanos,
+    expiration_ns: UnixNanos,
+    price_precision: u8,
+    size_precision: u8,
+    price_increment: Price,
+    size_increment: Quantity,
+    multiplier: Quantity,
+    lot_size: Quantity,
+    max_quantity: Option<Quantity>,
+    min_quantity: Option<Quantity>,
+    max_price: Option<Price>,
+    min_price: Option<Price>,
+    margin_init: Decimal,
+    margin_maint: Decimal,
+    tick_scheme: Option<Ustr>,
+    info: Option<Params>,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+}
+
+impl TryFrom<OptionContractRepr> for OptionContract {
+    type Error = String;
+
+    fn try_from(repr: OptionContractRepr) -> Result<Self, Self::Error> {
+        let resolve = |field: Option<Currency>, name: &str| {
+            field
+                .or(repr.currency)
+                .ok_or_else(|| format!("missing field `{name}`"))
+        };
+        let strike_currency = resolve(repr.strike_currency, "strike_currency")?;
+        let quote_currency = resolve(repr.quote_currency, "quote_currency")?;
+        let settlement_currency = resolve(repr.settlement_currency, "settlement_currency")?;
+
+        Ok(Self {
+            id: repr.id,
+            raw_symbol: repr.raw_symbol,
+            asset_class: repr.asset_class,
+            exchange: repr.exchange,
+            underlying: repr.underlying,
+            underlying_instrument_id: repr.underlying_instrument_id,
+            option_kind: repr.option_kind,
+            strike_price: repr.strike_price,
+            strike_currency,
+            quote_currency,
+            settlement_currency,
+            premium_style: repr.premium_style,
+            exercise_style: repr.exercise_style,
+            settlement_type: repr.settlement_type,
+            activation_ns: repr.activation_ns,
+            expiration_ns: repr.expiration_ns,
+            price_precision: repr.price_precision,
+            size_precision: repr.size_precision,
+            price_increment: repr.price_increment,
+            size_increment: repr.size_increment,
+            multiplier: repr.multiplier,
+            lot_size: repr.lot_size,
+            max_quantity: repr.max_quantity,
+            min_quantity: repr.min_quantity,
+            max_price: repr.max_price,
+            min_price: repr.min_price,
+            margin_init: repr.margin_init,
+            margin_maint: repr.margin_maint,
+            tick_scheme: repr.tick_scheme,
+            info: repr.info,
+            ts_event: repr.ts_event,
+            ts_init: repr.ts_init,
+        })
+    }
 }
 
 #[bon::bon]
@@ -726,5 +826,42 @@ mod tests {
         encoded["settlement_type"] = serde_json::Value::Null;
         assert_eq!(serde_json::to_value(&restored_legacy).unwrap(), encoded);
         assert_eq!(option, legacy);
+    }
+
+    #[rstest]
+    fn test_deserialize_legacy_single_currency(option_contract_appl: OptionContract) {
+        let encoded = serde_json::to_value(&option_contract_appl).unwrap();
+        let mut legacy = encoded.clone();
+        let fields = legacy.as_object_mut().unwrap();
+        let currency = fields.remove("quote_currency").unwrap();
+        fields.remove("strike_currency");
+        fields.remove("settlement_currency");
+        fields.insert("currency".to_string(), currency);
+
+        let restored: OptionContract = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(
+            restored.strike_currency,
+            option_contract_appl.quote_currency
+        );
+        assert_eq!(restored.quote_currency, option_contract_appl.quote_currency);
+        assert_eq!(
+            restored.settlement_currency,
+            option_contract_appl.quote_currency
+        );
+        assert_eq!(serde_json::to_value(&restored).unwrap(), encoded);
+    }
+
+    #[rstest]
+    fn test_deserialize_without_any_currency_fails(option_contract_appl: OptionContract) {
+        let mut encoded = serde_json::to_value(&option_contract_appl).unwrap();
+        let fields = encoded.as_object_mut().unwrap();
+        fields.remove("strike_currency");
+        fields.remove("quote_currency");
+        fields.remove("settlement_currency");
+
+        let err = serde_json::from_value::<OptionContract>(encoded).unwrap_err();
+
+        assert!(err.to_string().contains("strike_currency"), "{err}");
     }
 }
